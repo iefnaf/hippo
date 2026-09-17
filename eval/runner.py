@@ -17,6 +17,11 @@ fixed in the design document:
 Reader/judge stages stay pending in this milestone (M1 辅助问答 lands in
 a later issue); a failed ingest/retrieve/prepare marks the sample
 failed with its failed_stage while its artifacts are still persisted.
+
+RunnerBase carries the machinery shared with the operations suite
+(eval.operations): attempt recording with usage capture, lifecycle
+logging, mutation submission with completion confirmation and the
+pre-run capability cross-check.
 """
 
 from __future__ import annotations
@@ -114,14 +119,21 @@ def _operation_id(run_id: str, namespace: str, stage: str, seq: int, payload: An
     return f"{run_id}:{namespace}:{stage}:{seq:03d}:{digest}"
 
 
-class OfflineRunner:
-    """Runs the offline loop for every configured sample."""
+class RunnerBase:
+    """Shared run machinery: attempt recording, mutations, capability gate.
+
+    Both the offline QA runner and the operations suite record every
+    adapter call as a StageAttempt plus a full-payload AttemptEntry,
+    submit mutations with completion confirmation (accepted receipts are
+    awaited on the same operation id, never re-submitted) and refuse to
+    start when the config's capability declaration disagrees with the
+    adapter.
+    """
 
     def __init__(
         self,
         *,
         config: Any,
-        dataset: Any,
         adapter: MemoryAdapter,
         store: RunStore,
         run_id: str,
@@ -129,18 +141,17 @@ class OfflineRunner:
         monotonic: Callable[[], float] = time.perf_counter,
     ) -> None:
         self.config = config
-        self.dataset = dataset
         self.adapter = adapter
         self.store = store
         self.run_id = run_id
         self._clock = clock
         self._monotonic = monotonic
         self._attempt_seq = 0
+        self._lifecycle_entries: list[AttemptEntry] = []
 
     # -- pre-run checks ----------------------------------------------------
 
-    def _pre_run_checks(self) -> None:
-        self.dataset.require_handles(self.config.sample_ids)
+    def _check_capabilities(self) -> None:
         declared = set(self.config.memory.capabilities)
         provided = set(self.adapter.capabilities())
         if declared != provided:
@@ -154,62 +165,14 @@ class OfflineRunner:
                 location="/memory/capabilities",
             )
 
-    def _plan_counts(self, async_mutation: bool) -> dict[str, SamplePlanCounts]:
-        counts: dict[str, SamplePlanCounts] = {}
-        for handle in self.config.sample_ids:
-            n_sessions = len(self.dataset.iter_sessions(handle))
-            counts[handle] = SamplePlanCounts(
-                sessions=n_sessions,
-                ingest_calls=n_sessions,
-                await_ready_calls=n_sessions if async_mutation else 0,
-                open_calls=n_sessions + 1,
-                close_calls=n_sessions + 1,
-                retrieve_calls=1,
-            )
-        return counts
-
-    # -- run ---------------------------------------------------------------
-
-    def run(self) -> RunOutcome:
-        self._pre_run_checks()
-        async_mutation = "async_mutation" in set(self.adapter.capabilities())
-        manifest = RunManifest(
-            run_id=self.run_id,
-            created_at=self._clock(),
-            config_name=self.config.name,
-            config_fingerprint=self.config.fingerprint(),
-            metrics_registry_version=self.config.canonical_payload()[
-                "metrics_registry_version"
-            ],
-            dataset_plan=self.config.dataset_plan,
-            sample_plan_id=self.config.sample_plan_id,
-            sample_ids=tuple(self.config.sample_ids),
-            evidence_token_budget=self.config.evidence_token_budget,
-            memory_declaration=self.config.memory.model_dump(mode="json"),
-            async_mutation=async_mutation,
-            plan_counts=self._plan_counts(async_mutation),
-        )
-        from eval.config import ConfigArtifact
-
-        self.store.create(
-            manifest,
-            ConfigArtifact(
-                config=self.config, config_fingerprint=self.config.fingerprint()
-            ),
-        )
-        outcome = RunOutcome(run_id=self.run_id, run_dir=self.store.dir)
-        for handle in self.config.sample_ids:
-            artifact = self._run_sample(handle, async_mutation)
-            outcome.results.append(artifact)
-            if artifact.result.qa_status == "failed":
-                outcome.failed += 1
-        return outcome
-
     # -- attempt recording -------------------------------------------------
 
     def _next_attempt_id(self, stage: str) -> str:
         self._attempt_seq += 1
         return f"att_{self._attempt_seq:04d}_{stage}"
+
+    def _op_id(self, namespace: str, stage: str, seq: int, payload: Any) -> str:
+        return _operation_id(self.run_id, namespace, stage, seq, payload)
 
     def _record_call(
         self,
@@ -318,11 +281,195 @@ class OfflineRunner:
             # diagnostics; they never overwrite the failed stage.
             pass
 
+    # -- mutation submission ------------------------------------------------
+
+    def _submit_mutation(
+        self,
+        *,
+        stage: str,
+        method: str,
+        namespace: str,
+        operation_id: str,
+        input_payload: dict[str, Any],
+        fn: Callable[[], Any],
+        attempts: list[StageAttempt],
+        entries: list[AttemptEntry],
+        stage_states: dict[str, str] | None = None,
+    ) -> MutationReceipt:
+        """Submit one mutation and confirm completion before returning.
+
+        Accepted receipts are awaited on the SAME operation id; the
+        submit and the wait are both recorded. Anything other than a
+        completed receipt fails the stage.
+        """
+        receipt, attempt, entry, error = self._record_call(
+            stage=stage,
+            method=method,
+            namespace=namespace,
+            operation_id=operation_id,
+            input_payload=input_payload,
+            fn=fn,
+        )
+        attempts.append(attempt)
+        entries.append(entry)
+        if error is not None:
+            raise _StageFailure(stage, error)
+        assert receipt is not None
+        self._check_receipt_identity(receipt, operation_id, stage)
+        final: MutationReceipt = receipt
+        if receipt.status == "accepted":
+            final = self._await_ready(namespace, operation_id, attempts, entries)
+            if stage_states is not None:
+                stage_states["await_ready"] = "completed"
+        if final.status != "completed":
+            failure = final.error or ErrorInfo(
+                code="mutation_not_completed",
+                message=(
+                    f"{method} ended in status {final.status!r} without "
+                    "a completion confirmation"
+                ),
+                effect="possible",
+                transient=False,
+            )
+            raise _StageFailure(stage, failure)
+        if stage_states is not None:
+            stage_states[stage] = "completed"
+        return final
+
+    def _await_ready(
+        self,
+        namespace: str,
+        operation_id: str,
+        attempts: list[StageAttempt],
+        entries: list[AttemptEntry],
+    ) -> MutationReceipt:
+        timeout = self.config.run_params.await_ready_timeout_s
+        while True:
+            receipt, attempt, entry, error = self._record_call(
+                stage="await_ready",
+                method="await_ready",
+                namespace=namespace,
+                operation_id=operation_id,
+                input_payload={
+                    "operation_id": operation_id,
+                    "timeout_s": timeout,
+                },
+                fn=lambda: self.adapter.await_ready(namespace, operation_id, timeout),
+            )
+            attempts.append(attempt)
+            entries.append(entry)
+            if error is not None:
+                raise _StageFailure("await_ready", error)
+            assert receipt is not None
+            self._check_receipt_identity(receipt, operation_id, "await_ready")
+            if receipt.status in ("completed", "failed"):
+                return receipt
+            # still accepted: keep waiting on the SAME operation id
+
+    def _check_receipt_identity(
+        self, receipt: MutationReceipt, operation_id: str, stage: str
+    ) -> None:
+        if receipt.operation_id != operation_id:
+            raise _StageFailure(
+                stage,
+                ErrorInfo(
+                    code="receipt_operation_mismatch",
+                    message=(
+                        f"receipt echoes operation id {receipt.operation_id!r} "
+                        f"but the call used {operation_id!r}"
+                    ),
+                    effect="possible",
+                    transient=False,
+                ),
+            )
+
+
+class OfflineRunner(RunnerBase):
+    """Runs the offline QA loop for every configured sample."""
+
+    def __init__(
+        self,
+        *,
+        config: Any,
+        dataset: Any,
+        adapter: MemoryAdapter,
+        store: RunStore,
+        run_id: str,
+        clock: Callable[[], str] = now_utc,
+        monotonic: Callable[[], float] = time.perf_counter,
+    ) -> None:
+        super().__init__(
+            config=config,
+            adapter=adapter,
+            store=store,
+            run_id=run_id,
+            clock=clock,
+            monotonic=monotonic,
+        )
+        self.dataset = dataset
+
+    # -- pre-run checks ----------------------------------------------------
+
+    def _pre_run_checks(self) -> None:
+        self.dataset.require_handles(self.config.sample_ids)
+        self._check_capabilities()
+
+    def _plan_counts(self, async_mutation: bool) -> dict[str, SamplePlanCounts]:
+        counts: dict[str, SamplePlanCounts] = {}
+        for handle in self.config.sample_ids:
+            n_sessions = len(self.dataset.iter_sessions(handle))
+            counts[handle] = SamplePlanCounts(
+                sessions=n_sessions,
+                ingest_calls=n_sessions,
+                await_ready_calls=n_sessions if async_mutation else 0,
+                open_calls=n_sessions + 1,
+                close_calls=n_sessions + 1,
+                retrieve_calls=1,
+            )
+        return counts
+
+    # -- run ---------------------------------------------------------------
+
+    def run(self) -> RunOutcome:
+        self._pre_run_checks()
+        async_mutation = "async_mutation" in set(self.adapter.capabilities())
+        manifest = RunManifest(
+            run_id=self.run_id,
+            created_at=self._clock(),
+            config_name=self.config.name,
+            config_fingerprint=self.config.fingerprint(),
+            metrics_registry_version=self.config.canonical_payload()[
+                "metrics_registry_version"
+            ],
+            dataset_plan=self.config.dataset_plan,
+            sample_plan_id=self.config.sample_plan_id,
+            sample_ids=tuple(self.config.sample_ids),
+            evidence_token_budget=self.config.evidence_token_budget,
+            memory_declaration=self.config.memory.model_dump(mode="json"),
+            async_mutation=async_mutation,
+            plan_counts=self._plan_counts(async_mutation),
+        )
+        from eval.config import ConfigArtifact
+
+        self.store.create(
+            manifest,
+            ConfigArtifact(
+                config=self.config, config_fingerprint=self.config.fingerprint()
+            ),
+        )
+        outcome = RunOutcome(run_id=self.run_id, run_dir=self.store.dir)
+        for handle in self.config.sample_ids:
+            artifact = self._run_sample(handle, async_mutation)
+            outcome.results.append(artifact)
+            if artifact.result.qa_status == "failed":
+                outcome.failed += 1
+        return outcome
+
     # -- per-sample loop ----------------------------------------------------
 
     def _run_sample(self, handle: str, async_mutation: bool) -> ResultArtifact:
         namespace = self.dataset.namespace_for(handle, self.config.sample_plan_id)
-        self._lifecycle_entries: list[AttemptEntry] = []
+        self._lifecycle_entries = []
         stage_states: dict[str, str] = {
             "ingest": "pending",
             "retrieve": "pending",
@@ -334,7 +481,6 @@ class OfflineRunner:
         attempts: list[StageAttempt] = []
         entries: list[AttemptEntry] = []
         failed_stage: str | None = None
-        failure: ErrorInfo | None = None
         raw_evidence: list[Evidence] | None = None
         prepared: PreparedEvidence | None = None
         sessions = self.dataset.iter_sessions(handle)
@@ -346,10 +492,10 @@ class OfflineRunner:
                 self._record_lifecycle(
                     "open", namespace, lambda: self.adapter.open(namespace)
                 )
-                operation_id = _operation_id(
-                    self.run_id, namespace, "ingest", i, session.model_dump(mode="json")
+                operation_id = self._op_id(
+                    namespace, "ingest", i, session.model_dump(mode="json")
                 )
-                receipt, attempt, entry, error = self._record_call(
+                self._submit_mutation(
                     stage="ingest",
                     method="ingest",
                     namespace=namespace,
@@ -359,30 +505,10 @@ class OfflineRunner:
                         "operation_id": operation_id,
                     },
                     fn=lambda: self.adapter.ingest(namespace, session, operation_id),
+                    attempts=attempts,
+                    entries=entries,
+                    stage_states=stage_states,
                 )
-                attempts.append(attempt)
-                entries.append(entry)
-                if error is not None:
-                    raise _StageFailure("ingest", error)
-                assert receipt is not None
-                self._check_receipt_identity(receipt, operation_id, "ingest")
-                final: MutationReceipt = receipt
-                if receipt.status == "accepted":
-                    final = self._await_ready(
-                        namespace, operation_id, attempts, entries
-                    )
-                    stage_states["await_ready"] = "completed"
-                if final.status != "completed":
-                    failure = final.error or ErrorInfo(
-                        code="mutation_not_completed",
-                        message=(
-                            f"ingest ended in status {final.status!r} without "
-                            "a completion confirmation"
-                        ),
-                        effect="possible",
-                        transient=False,
-                    )
-                    raise _StageFailure("ingest", failure)
                 self._record_lifecycle(
                     "close", namespace, lambda: self.adapter.close(namespace)
                 )
@@ -439,7 +565,6 @@ class OfflineRunner:
             stage_states["prepare"] = "completed"
         except _StageFailure as exc:
             failed_stage = exc.stage
-            failure = exc.error
             stage_states[exc.stage] = "failed"
         finally:
             # Best-effort close; lifecycle failures land in the log only.
@@ -498,53 +623,6 @@ class OfflineRunner:
         artifact = ResultArtifact(result=result)
         self.store.append_result(artifact)
         return artifact
-
-    def _await_ready(
-        self,
-        namespace: str,
-        operation_id: str,
-        attempts: list[StageAttempt],
-        entries: list[AttemptEntry],
-    ) -> MutationReceipt:
-        timeout = self.config.run_params.await_ready_timeout_s
-        while True:
-            receipt, attempt, entry, error = self._record_call(
-                stage="await_ready",
-                method="await_ready",
-                namespace=namespace,
-                operation_id=operation_id,
-                input_payload={
-                    "operation_id": operation_id,
-                    "timeout_s": timeout,
-                },
-                fn=lambda: self.adapter.await_ready(namespace, operation_id, timeout),
-            )
-            attempts.append(attempt)
-            entries.append(entry)
-            if error is not None:
-                raise _StageFailure("await_ready", error)
-            assert receipt is not None
-            self._check_receipt_identity(receipt, operation_id, "await_ready")
-            if receipt.status in ("completed", "failed"):
-                return receipt
-            # still accepted: keep waiting on the SAME operation id
-
-    def _check_receipt_identity(
-        self, receipt: MutationReceipt, operation_id: str, stage: str
-    ) -> None:
-        if receipt.operation_id != operation_id:
-            raise _StageFailure(
-                stage,
-                ErrorInfo(
-                    code="receipt_operation_mismatch",
-                    message=(
-                        f"receipt echoes operation id {receipt.operation_id!r} "
-                        f"but the call used {operation_id!r}"
-                    ),
-                    effect="possible",
-                    transient=False,
-                ),
-            )
 
 
 def _prepare_error_transform(exc: Exception) -> ErrorInfo:
