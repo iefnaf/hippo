@@ -1,0 +1,251 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "单题评测：检索、回答与评分的调用顺序",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "viewBox": [
+      1080,
+      610
+    ]
+  },
+  "participants": [
+    {
+      "id": "runner",
+      "type": "backend",
+      "label": "Runner",
+      "sublabel": "统一调度与保存"
+    },
+    {
+      "id": "dataset",
+      "type": "database",
+      "label": "Dataset adapter",
+      "sublabel": "问题与评分私有数据"
+    },
+    {
+      "id": "memory",
+      "type": "backend",
+      "label": "Memory adapter",
+      "sublabel": "检索已写入的历史"
+    },
+    {
+      "id": "evidence",
+      "type": "backend",
+      "label": "Reader 输入准备",
+      "sublabel": "校验 · 渲染 · 预算"
+    },
+    {
+      "id": "reader",
+      "type": "cloud",
+      "label": "Reader",
+      "sublabel": "内部调用回答 LLM"
+    },
+    {
+      "id": "scorer",
+      "type": "backend",
+      "label": "Scorer",
+      "sublabel": "程序指标与问答评分"
+    },
+    {
+      "id": "judge",
+      "type": "cloud",
+      "label": "Judge",
+      "sublabel": "内部调用评分 LLM"
+    }
+  ],
+  "segments": [
+    {
+      "from": 150,
+      "to": 201,
+      "label": "取问题"
+    },
+    {
+      "from": 207,
+      "to": 313,
+      "label": "检索"
+    },
+    {
+      "from": 319,
+      "to": 369,
+      "label": "回答"
+    },
+    {
+      "from": 375,
+      "to": 540,
+      "label": "评分"
+    }
+  ],
+  "messages": [
+    {
+      "id": "question-call",
+      "from": "runner",
+      "to": "dataset",
+      "y": 160,
+      "label": "get_question()",
+      "note": "读取当前题目的问题与 question_date，并获得不含 gold 的 sample_handle。评分标注保留在 harness 的私有评分数据范围。"
+    },
+    {
+      "id": "question-result",
+      "from": "dataset",
+      "to": "runner",
+      "y": 188,
+      "label": "问题 + 提问时间",
+      "variant": "return"
+    },
+    {
+      "id": "retrieval-call",
+      "from": "runner",
+      "to": "memory",
+      "y": 216,
+      "label": "retrieve(request)",
+      "variant": "emphasis",
+      "note": "request 包含 query、question_date 和 token_budget；不发送标准答案、官方来源 ID、gold 会话或答案标注。历史已按会话写入并持久化。"
+    },
+    {
+      "id": "retrieval-result",
+      "from": "memory",
+      "to": "runner",
+      "y": 244,
+      "label": "原始 Evidence",
+      "variant": "return",
+      "note": "Memory 只返回证据及来源，不生成最终答案。"
+    },
+    {
+      "id": "evidence-call",
+      "from": "runner",
+      "to": "evidence",
+      "y": 272,
+      "label": "prepare(raw, tokenizer, budget)",
+      "note": "使用不含 gold 的清洗历史校验原文范围；统一渲染证据和元数据，计数并执行默认 4K tokens 预算，保留截断后实际来源。"
+    },
+    {
+      "id": "evidence-result",
+      "from": "evidence",
+      "to": "runner",
+      "y": 300,
+      "label": "PreparedEvidence",
+      "variant": "return",
+      "note": "包含实际送入 Reader 的文本、token 数、实际证据来源和截断记录。"
+    },
+    {
+      "id": "reader-call",
+      "from": "runner",
+      "to": "reader",
+      "y": 328,
+      "label": "answer(question, date, evidence)",
+      "variant": "emphasis",
+      "note": "Reader 使用固定 prompt 和模型调用 LLM；只根据问题、评测时点和 PreparedEvidence 回答，不可见标准答案。"
+    },
+    {
+      "id": "reader-result",
+      "from": "reader",
+      "to": "runner",
+      "y": 356,
+      "label": "ReaderResult：回答与用量",
+      "variant": "return"
+    },
+    {
+      "id": "scoring-call",
+      "from": "runner",
+      "to": "scorer",
+      "y": 384,
+      "label": "score_query_result()",
+      "note": "Runner 传入 sample_handle、问题、PreparedEvidence 和 ReaderResult；不向 Memory 或 Reader 传递 gold。Scorer 在评分模块内读取私有数据，用程序独立计算证据召回率，再按官方协议评分问答；拒答题不计检索召回率。"
+    },
+    {
+      "id": "private-call",
+      "from": "scorer",
+      "to": "dataset",
+      "y": 412,
+      "label": "读取评分数据(sample_handle)",
+      "variant": "security",
+      "note": "只在评分阶段读取标准答案、官方证据标注、匿名来源 ID 到官方 ID 的私有映射和 abstention 标志；这些数据不发送给 Memory 或 Reader。"
+    },
+    {
+      "id": "private-result",
+      "from": "dataset",
+      "to": "scorer",
+      "y": 440,
+      "label": "标准答案 + gold/map + abstention",
+      "variant": "return"
+    },
+    {
+      "id": "judge-call",
+      "from": "scorer",
+      "to": "judge",
+      "y": 468,
+      "label": "evaluate()",
+      "variant": "emphasis",
+      "note": "Judge 用固定模型调用 LLM，接收问题、标准答案、Reader 回答和评分协议；不改变 Reader 回答。"
+    },
+    {
+      "id": "judge-result",
+      "from": "judge",
+      "to": "scorer",
+      "y": 496,
+      "label": "评分判定",
+      "variant": "return"
+    },
+    {
+      "id": "scoring-result",
+      "from": "scorer",
+      "to": "runner",
+      "y": 524,
+      "label": "检索指标 + 回答评分",
+      "variant": "return",
+      "note": "Runner 保存逐阶段记录、输入、返回值、用量、耗时与失败状态。Reporter 在运行结束后读取这些记录生成报告，不参与单题调用链。"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "runner",
+      "from": 155,
+      "to": 532,
+      "type": "backend"
+    },
+    {
+      "participant": "dataset",
+      "from": 160,
+      "to": 193,
+      "type": "database"
+    },
+    {
+      "participant": "memory",
+      "from": 216,
+      "to": 249,
+      "type": "backend"
+    },
+    {
+      "participant": "evidence",
+      "from": 272,
+      "to": 305,
+      "type": "backend"
+    },
+    {
+      "participant": "reader",
+      "from": 328,
+      "to": 361,
+      "type": "cloud"
+    },
+    {
+      "participant": "dataset",
+      "from": 412,
+      "to": 445,
+      "type": "database"
+    },
+    {
+      "participant": "scorer",
+      "from": 384,
+      "to": 529,
+      "type": "backend"
+    },
+    {
+      "participant": "judge",
+      "from": 468,
+      "to": 501,
+      "type": "cloud"
+    }
+  ]
+}
