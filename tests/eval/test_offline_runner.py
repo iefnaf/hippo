@@ -12,8 +12,10 @@ from eval.contracts.adapter import Evidence, SourceSpan
 from eval.contracts.common import ContractError
 from eval.contracts.internal import PreparedEvidenceArtifact, RawEvidenceArtifact, ResultArtifact
 from eval.datasets.manual import ManualDataset
+from eval.judges.fake import FakeJudge, FakeJudgeSpec
 from eval.memories.base import MemoryAdapterError
 from eval.memories.fake import FakeMemoryAdapter, FakeMemorySpec
+from eval.readers.fake import FakeReader, FakeReaderSpec
 from eval.runner import OfflineRunner
 from eval.runs import RunStore, new_run_id
 
@@ -74,11 +76,21 @@ def custom_config(**overrides):
     return load_config_dict(data)
 
 
-def make_runner(tmp_path: Path, config, adapter=None, dataset=None, run_id=None):
+def make_runner(
+    tmp_path: Path,
+    config,
+    adapter=None,
+    dataset=None,
+    run_id=None,
+    reader=None,
+    judge=None,
+):
     dataset = dataset or ManualDataset.load_default()
     adapter = adapter or FakeMemoryAdapter(
         FakeMemorySpec.from_memory_plan(config.memory)
     )
+    reader = reader or FakeReader(FakeReaderSpec.from_reader_plan(config.reader))
+    judge = judge or FakeJudge(FakeJudgeSpec.from_judge_plan(config.judge))
     run_id = run_id or f"run-test-{config.fingerprint()[:8]}"
     store = RunStore(tmp_path / "runs", run_id)
     return (
@@ -86,6 +98,8 @@ def make_runner(tmp_path: Path, config, adapter=None, dataset=None, run_id=None)
             config=config,
             dataset=dataset,
             adapter=adapter,
+            reader=reader,
+            judge=judge,
             store=store,
             run_id=run_id,
         ),
@@ -171,12 +185,26 @@ class TestRunWithManifestArtifacts:
             assert result.run_id == outcome.run_id
             assert result.config_fingerprint == config.fingerprint()
             assert result.suite == "qa"
-            assert result.qa_status == "pending"
+            assert result.qa_status == "scored"
+            assert isinstance(result.correct, bool)
+            assert result.attribution in (
+                "hit_correct",
+                "hit_wrong",
+                "miss_correct",
+                "miss_wrong",
+            )
             assert result.stage_states["ingest"] == "completed"
             assert result.stage_states["retrieve"] == "completed"
             assert result.stage_states["prepare"] == "completed"
-            assert result.stage_states["read"] == "pending"
+            assert result.stage_states["read"] == "completed"
+            assert result.stage_states["score"] == "completed"
+            assert result.stage_states["judge"] == "completed"
             assert result.failed_stage is None
+            assert result.metrics  # recall + derivation metrics recorded
+
+        # The run also carries the summary report (JSON + Markdown).
+        assert (run_dir / "report.json").exists()
+        assert (run_dir / "report.md").exists()
 
     def test_attempts_record_stage_timing_and_usage(self, tmp_path: Path):
         config = load_config()
@@ -185,7 +213,14 @@ class TestRunWithManifestArtifacts:
         for artifact in outcome.results:
             attempts = artifact.result.attempts
             stages = {a.stage for a in attempts}
-            assert {"ingest", "await_ready", "retrieve", "prepare"} <= stages
+            assert {
+                "ingest",
+                "await_ready",
+                "retrieve",
+                "prepare",
+                "read",
+                "judge",
+            } <= stages
             for attempt in attempts:
                 assert attempt.elapsed_ms is not None and attempt.elapsed_ms >= 0
                 assert attempt.started_at and attempt.ended_at
@@ -196,6 +231,11 @@ class TestRunWithManifestArtifacts:
             )
             retrieve = [a for a in attempts if a.stage == "retrieve"]
             assert all(a.usage.output_tokens is not None for a in retrieve)
+            read = [a for a in attempts if a.stage == "read"]
+            assert all(a.usage is not None for a in read)
+            judge = [a for a in attempts if a.stage == "judge"]
+            assert all(a.usage is not None for a in judge)
+            assert all(a.usage.llm_call_count == 1 for a in judge)
 
     def test_artifact_refs_resolve_and_checksum(self, tmp_path: Path):
         config = load_config()
@@ -443,7 +483,7 @@ class TestBudgetEnforcement:
         runner, _ = make_runner(tmp_path, config, adapter=adapter)
         outcome = runner.run()
         result = outcome.results[0].result
-        assert result.qa_status == "pending"
+        assert result.qa_status == "scored"
 
         store = RunStore(tmp_path / "runs", outcome.run_id)
         raw_doc = RawEvidenceArtifact.model_validate(

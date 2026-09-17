@@ -389,6 +389,32 @@ class JudgeRecordArtifact(SchemaVersionedModel):
     result: JudgeResult
 
 
+class ScoringTraceArtifact(SchemaVersionedModel):
+    """Private scoring trace: how recall and attribution were derived.
+
+    Contains gold and the internal->official mapping, so like the judge
+    record it is a harness-private artifact: never an adapter, reader or
+    reporter-input path into any tested component. The Reporter reads it
+    for category fields and micro-recall denominators only.
+    """
+
+    run_id: str
+    sample_handle: str
+    stage: Literal["score"] = "score"
+    scoring: ScoringData
+    evidence_mode: Literal[
+        "extractive_declared", "generated_only", "none_baseline"
+    ]
+    gold_internal_sessions: list[str]
+    actual_sessions_in_order: list[str]
+    hit_gold_sessions: list[str]
+    recall_applicable: bool
+    recall_na_reason: str | None
+    recall_value: float | None
+    hit_criterion: Literal["gold_recall", "nonempty_evidence", "never"]
+    hit: bool
+
+
 class ResultArtifact(SchemaVersionedModel):
     """Persisted per-sample Result (progress, metrics, artifact refs)."""
 

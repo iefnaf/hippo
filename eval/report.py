@@ -1,0 +1,1064 @@
+"""Run summary reporter: JSON + Markdown aggregation.
+
+The reporter reads ONLY persisted run artifacts (manifest, config
+snapshot, per-sample JSONL and their referenced artifacts); it never
+triggers retrieval, answering or re-scoring. Every metric entering the
+formal table comes from the v1 metric registry; the evidence budget
+composition and the scale/cost model are clearly marked diagnostics.
+
+Aggregation rules follow the design doc (适用范围、状态与统计分母):
+
+- planned question score: correct / |P|; failed, context_exceeded and
+  invalid_input all contribute zero (never folded into "wrong");
+- scored accuracy: correct / scored, N/A when scored==0;
+- runnable coverage: (|P| - context_exceeded) / |P|;
+- retrieval recall aggregates run over the applicable set E
+  (non-abstention, extractive-declared, valid gold); micro recall uses
+  gold session counts as denominator;
+- the 2x2 attribution uses ONLY scored questions; failed,
+  context_exceeded, pending and invalid_input are listed separately;
+- budget composition reports adapter-returned units, units entering the
+  reader, dropped/truncated units and their tokens (diagnostic, test
+  counting mode only in M1);
+- the scale & cost model compares planned call counts with actual ones
+  and extrapolates fake unit costs (explicitly marked estimates).
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+from typing import Any
+
+from eval.contracts.internal import (
+    PreparedEvidenceArtifact,
+    RawEvidenceArtifact,
+    ResultArtifact,
+    ScoringTraceArtifact,
+)
+from eval.metrics import REGISTRY_CONTENT_VERSION, get_metric
+from eval.runs import AttemptLogArtifact, RunStore
+
+#: Formal metric ids reported for a qa-suite run (all registered v1).
+FORMAL_METRIC_ORDER = (
+    "planned_question_score",
+    "scored_accuracy",
+    "scoring_coverage",
+    "runnable_coverage",
+    "abstention_accuracy",
+    "attribution_hit_correct",
+    "attribution_hit_wrong",
+    "attribution_miss_correct",
+    "attribution_miss_wrong",
+    "verifiable_session_recall_macro",
+    "verifiable_session_recall_micro",
+    "recall_at_1",
+    "recall_at_3",
+    "recall_at_5",
+    "budgeted_session_recall",
+    "derivation_source_coverage",
+    "retrieval_returned_units",
+    "retrieval_reader_units",
+    "retrieval_dropped_units",
+    "evidence_text_tokens",
+    "evidence_format_tokens",
+    "ingest_latency_ms",
+    "retrieve_latency_ms_p50",
+    "retrieve_latency_ms_p95",
+)
+
+ATTRIBUTION_CELLS = (
+    "hit_correct",
+    "hit_wrong",
+    "miss_correct",
+    "miss_wrong",
+)
+
+HIT_CRITERION_NOTES = {
+    "gold_recall": (
+        "gold_recall：实现声明提供原文检索，命中 = 4K 预算内实际保留的原文证据与 "
+        "gold 会话集合有交集（session recall > 0）；拒答题 gold 为空，恒为未命中"
+    ),
+    "nonempty_evidence": (
+        "nonempty_evidence：无可核验 gold 来源的对照（纯生成/完整历史），"
+        "命中 = 实际进入了 Reader 的证据非空"
+    ),
+    "never": "never：无记忆基线恒为未命中",
+}
+
+
+class ReportError(ValueError):
+    """The run directory cannot be summarized."""
+
+
+# ---------------------------------------------------------------------------
+# Report models
+# ---------------------------------------------------------------------------
+
+
+class ReportHeader(dict):
+    """Plain key/value header (kept a dict for simple JSON rendering)."""
+
+
+class MetricAggregate(dict):
+    """{metric_id, status, value, denominator, reason}."""
+
+
+class SummaryReport(dict):
+    """The full report payload (also persisted with schema_version)."""
+
+
+def _mean(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def _percentile(values: list[float], q: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = q * (len(ordered) - 1)
+    lo, hi = math.floor(pos), math.ceil(pos)
+    if lo == hi:
+        return ordered[lo]
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * (pos - lo)
+
+
+def _round(value: float | None, digits: int = 6) -> float | None:
+    return None if value is None else round(value, digits)
+
+
+class Reporter:
+    """Builds the summary report from one run directory."""
+
+    def __init__(self, run_dir: str | Path) -> None:
+        self.run_dir = Path(run_dir)
+        if not (self.run_dir / "run.json").exists():
+            raise ReportError(f"not a run directory: {self.run_dir}")
+        manifest = json.loads((self.run_dir / "run.json").read_text(encoding="utf-8"))
+        self.manifest = manifest
+        config_doc = json.loads((self.run_dir / "config.json").read_text(encoding="utf-8"))
+        self.config_doc = config_doc
+        self.store = RunStore(self.run_dir.parent, manifest["run_id"])
+
+    # -- loading ------------------------------------------------------------
+
+    def _load_results(self) -> list[Any]:
+        results = []
+        for line in self.store.read_result_lines():
+            results.append(ResultArtifact.load_json(json.dumps(line)).result)
+        planned_ids = list(self.manifest["sample_ids"])
+        seen = [r.sample_handle for r in results]
+        if sorted(seen) != sorted(planned_ids):
+            raise ReportError(
+                f"samples.jsonl handles {sorted(seen)} do not match the "
+                f"planned sample ids {sorted(planned_ids)}"
+            )
+        return results
+
+    def _load_ref(self, ref: str | None, model: Any) -> Any | None:
+        if ref is None:
+            return None
+        doc = json.loads(self.store.resolve_ref(ref).read_text(encoding="utf-8"))
+        return model.load_json(json.dumps(doc))
+
+    # -- build --------------------------------------------------------------
+
+    def build(self) -> SummaryReport:
+        results = self._load_results()
+        traces: dict[str, ScoringTraceArtifact | None] = {}
+        prepared: dict[str, PreparedEvidenceArtifact | None] = {}
+        raws: dict[str, RawEvidenceArtifact | None] = {}
+        logs: dict[str, AttemptLogArtifact | None] = {}
+        for result in results:
+            refs = result.artifact_refs
+            traces[result.sample_handle] = self._load_ref(
+                refs.get("scoring"), ScoringTraceArtifact
+            )
+            prepared[result.sample_handle] = self._load_ref(
+                refs.get("prepared_evidence"), PreparedEvidenceArtifact
+            )
+            raws[result.sample_handle] = self._load_ref(
+                refs.get("raw_evidence"), RawEvidenceArtifact
+            )
+            logs[result.sample_handle] = self._load_ref(refs.get("attempts"), AttemptLogArtifact)
+
+        config = self.config_doc["config"]
+        statuses = self._status_block(results, traces)
+        metrics = self._formal_metrics(results, traces, prepared, raws, logs, statuses)
+        attribution = self._attribution_block(results, traces)
+        budget = self._budget_composition(prepared, raws)
+        cost_model = self._cost_model(results, logs)
+        failures = self._failure_rows(results, logs)
+        header = {
+            "run_id": self.manifest["run_id"],
+            "command": self.manifest.get("command", "run"),
+            "created_at": self.manifest["created_at"],
+            "config_name": self.manifest["config_name"],
+            "config_fingerprint": self.manifest["config_fingerprint"],
+            "dataset_plan": self.manifest["dataset_plan"],
+            "sample_plan_id": self.manifest["sample_plan_id"],
+            "suite": "qa",
+            "evidence_token_budget": self.manifest["evidence_token_budget"],
+            "memory_name": config["memory"]["name"],
+            "memory_baseline_kind": config["memory"]["baseline_kind"],
+            "reader_model": config["reader"]["model"],
+            "reader_model_family": config["reader"]["model_family"],
+            "judge_model": config["judge"]["model"],
+            "judge_model_family": config["judge"]["model_family"],
+            "judge_protocol_id": config["judge"]["protocol_id"],
+            "counting_mode": config["reader"]["counting_mode"],
+            "metrics_registry_version": self.manifest["metrics_registry_version"],
+            "metrics_registry_content_version": REGISTRY_CONTENT_VERSION,
+        }
+        limitations = [
+            "M1 fake 成绩仅验证 harness 行为，不代表任何 memory 实现的性能。",
+            (
+                f"证据计数模式为 {config['reader']['counting_mode']}"
+                "（M1 为 1 token/字符的测试计数器）：预算与 tokens 数字"
+                "不与真实模型结果比较。"
+            ),
+            "规模与成本模型中的外推值为估算值，已与实测值分开标注。",
+            "正式指标全部来自指标注册表；证据预算构成与成本模型为诊断项。",
+            "smoke 子集成绩不进入正式报告。",
+        ]
+        if statuses["invalid_input"]:
+            limitations.insert(
+                0,
+                "本次运行包含 invalid_input 样本（数据校验错误），不构成完整 "
+                "正式报告；修正数据后需开启新 run。",
+            )
+        if statuses["pending"]:
+            limitations.insert(
+                0,
+                "本次运行存在未到终态（pending）的样本：报告仅为中间进度。",
+            )
+        return SummaryReport(
+            schema_version=1,
+            header=header,
+            statuses=statuses,
+            metrics=metrics,
+            attribution=attribution,
+            budget=budget,
+            cost_model=cost_model,
+            failures=failures,
+            limitations=limitations,
+        )
+
+    # -- blocks ---------------------------------------------------------------
+
+    def _status_block(self, results: list[Any], traces: dict[str, Any]) -> dict[str, Any]:
+        counts = {"scored": 0, "failed": 0, "context_exceeded": 0, "invalid_input": 0, "pending": 0}
+        for result in results:
+            counts[result.qa_status] += 1
+        failed_stages: dict[str, int] = {}
+        for result in results:
+            if result.failed_stage:
+                failed_stages[result.failed_stage] = (
+                    failed_stages.get(result.failed_stage, 0) + 1
+                )
+        planned = len(results)
+        abstention_planned = sum(
+            1
+            for r in results
+            if (traces.get(r.sample_handle) is not None)
+            and traces[r.sample_handle].scoring.is_abstention
+        )
+        abstention_scored = sum(
+            1
+            for r in results
+            if r.qa_status == "scored"
+            and (traces.get(r.sample_handle) is not None)
+            and traces[r.sample_handle].scoring.is_abstention
+        )
+        return {
+            "planned": planned,
+            "scored": counts["scored"],
+            "failed": counts["failed"],
+            "context_exceeded": counts["context_exceeded"],
+            "invalid_input": counts["invalid_input"],
+            "pending": counts["pending"],
+            "failed_stages": failed_stages,
+            "abstention_planned": abstention_planned,
+            "abstention_scored": abstention_scored,
+        }
+
+    def _formal_metrics(
+        self,
+        results: list[Any],
+        traces: dict[str, Any],
+        prepared: dict[str, Any],
+        raws: dict[str, Any],
+        logs: dict[str, Any],
+        statuses: dict[str, Any],
+    ) -> list[MetricAggregate]:
+        planned = statuses["planned"]
+        scored = statuses["scored"]
+        correct = sum(1 for r in results if r.qa_status == "scored" and r.correct)
+        aggregates: dict[str, MetricAggregate] = {}
+
+        def computed(metric_id: str, value: float | None, denominator: str) -> None:
+            aggregates[metric_id] = MetricAggregate(
+                metric_id=metric_id,
+                status="computed",
+                value=_round(value),
+                denominator=denominator,
+                reason=None,
+            )
+
+        def na(metric_id: str, reason: str, denominator: str = "") -> None:
+            aggregates[metric_id] = MetricAggregate(
+                metric_id=metric_id,
+                status="not_applicable",
+                value=None,
+                denominator=denominator,
+                reason=reason,
+            )
+
+        # -- QA overall -----------------------------------------------------
+        if planned:
+            computed("planned_question_score", correct / planned, f"|P|={planned}")
+            computed("scoring_coverage", scored / planned, f"|P|={planned}")
+            runnable = planned - statuses["context_exceeded"]
+            computed(
+                "runnable_coverage",
+                runnable / planned,
+                f"|P|={planned}（预检可运行 {runnable}）",
+            )
+        if scored:
+            computed("scored_accuracy", correct / scored, f"scored={scored}")
+        else:
+            na("scored_accuracy", "denominator_zero：没有成功评分的题目")
+        abstention_planned = statuses["abstention_planned"]
+        if abstention_planned:
+            correct_abs = sum(
+                1
+                for r in results
+                if r.qa_status == "scored"
+                and r.correct
+                and (traces.get(r.sample_handle) is not None)
+                and traces[r.sample_handle].scoring.is_abstention
+            )
+            computed(
+                "abstention_accuracy",
+                correct_abs / abstention_planned,
+                f"计划拒答题={abstention_planned}",
+            )
+        else:
+            na("abstention_accuracy", "denominator_zero：计划题目中没有拒答题")
+
+        # -- attribution shares ----------------------------------------------
+        cells = {c: 0 for c in ATTRIBUTION_CELLS}
+        for r in results:
+            if r.qa_status == "scored":
+                cells[r.attribution] += 1
+        for cell in ATTRIBUTION_CELLS:
+            metric_id = f"attribution_{cell}"
+            if scored:
+                computed(metric_id, cells[cell] / scored, f"scored={scored}")
+            else:
+                na(metric_id, "denominator_zero：没有成功评分的题目")
+
+        # -- recall aggregates -------------------------------------------------
+        by_metric: dict[str, list[float]] = {}
+        for r in results:
+            for metric in r.metrics:
+                if metric.status == "computed" and metric.value is not None:
+                    by_metric.setdefault(metric.metric_id, []).append(metric.value)
+        for metric_id in (
+            "verifiable_session_recall_macro",
+            "recall_at_1",
+            "recall_at_3",
+            "recall_at_5",
+            "budgeted_session_recall",
+        ):
+            values = by_metric.get(metric_id, [])
+            if values:
+                computed(metric_id, _mean(values), f"|E|={len(values)} 道适用题")
+            else:
+                na(
+                    metric_id,
+                    "denominator_zero / evidence_mode：没有适用题（非拒答、声明"
+                    "原文检索且 gold 有效），E=0",
+                )
+        applicable_traces = [t for t in traces.values() if t is not None and t.recall_applicable]
+        total_gold = sum(len(t.gold_internal_sessions) for t in applicable_traces)
+        total_hit = sum(len(t.hit_gold_sessions) for t in applicable_traces)
+        if total_gold:
+            computed(
+                "verifiable_session_recall_micro",
+                total_hit / total_gold,
+                f"gold 会话总数={total_gold}",
+            )
+        else:
+            modes = {
+                t.evidence_mode for t in traces.values() if t is not None
+            }
+            if modes and modes <= {"generated_only", "none_baseline"}:
+                reason = (
+                    "evidence_mode / denominator_zero：没有任何声明原文检索"
+                    "的适用题（E=0），gold 会话总数为 0"
+                )
+            else:
+                reason = "denominator_zero：适用题的 gold 会话总数为 0"
+            na("verifiable_session_recall_micro", reason)
+
+        # -- derivation coverage / budget composition --------------------------
+        gen_total = sum(
+            len(
+                [i for i in p.prepared.items if i.evidence.kind == "generated"]
+            )
+            for p in prepared.values()
+            if p is not None
+        )
+        gen_with_sources = sum(
+            len(
+                [
+                    i
+                    for i in p.prepared.items
+                    if i.evidence.kind == "generated"
+                    and i.evidence.derivation_sources
+                ]
+            )
+            for p in prepared.values()
+            if p is not None
+        )
+        if gen_total:
+            computed(
+                "derivation_source_coverage",
+                gen_with_sources / gen_total,
+                f"保留的生成内容单元={gen_total}",
+            )
+        else:
+            na(
+                "derivation_source_coverage",
+                "denominator_zero：没有保留的生成内容单元（诊断性指标）",
+            )
+
+        raw_returns = [len(r.evidence) for r in raws.values() if r is not None]
+        if raw_returns:
+            computed(
+                "retrieval_returned_units",
+                _mean([float(v) for v in raw_returns]),
+                f"有返回的检索次数={len(raw_returns)}",
+            )
+        else:
+            na("retrieval_returned_units", "denominator_zero：没有成功的检索")
+        prepared_list = [p.prepared for p in prepared.values() if p is not None]
+        if prepared_list:
+            computed(
+                "retrieval_reader_units",
+                _mean([float(len(p.items)) for p in prepared_list]),
+                f"完成准备的检索次数={len(prepared_list)}",
+            )
+            computed(
+                "retrieval_dropped_units",
+                _mean([float(len(p.dropped_raw_indices)) for p in prepared_list]),
+                f"完成准备的检索次数={len(prepared_list)}",
+            )
+            computed(
+                "evidence_text_tokens",
+                _mean([float(p.text_token_count) for p in prepared_list]),
+                f"完成准备的检索次数={len(prepared_list)}",
+            )
+            computed(
+                "evidence_format_tokens",
+                _mean([float(p.token_count - p.text_token_count) for p in prepared_list]),
+                f"完成准备的检索次数={len(prepared_list)}",
+            )
+        else:
+            for metric_id in (
+                "retrieval_reader_units",
+                "retrieval_dropped_units",
+                "evidence_text_tokens",
+                "evidence_format_tokens",
+            ):
+                na(metric_id, "denominator_zero：没有完成准备的检索")
+
+        # -- latency -----------------------------------------------------------
+        logical_ingest = self._logical_ingest_latencies(results)
+        if logical_ingest:
+            computed(
+                "ingest_latency_ms",
+                _mean(logical_ingest),
+                f"逻辑写入（含等待与重试）={len(logical_ingest)}",
+            )
+        else:
+            na("ingest_latency_ms", "denominator_zero：没有写入尝试")
+        retrieve_latencies = [
+            float(a.elapsed_ms)
+            for r in results
+            for a in r.attempts
+            if a.stage == "retrieve" and a.outcome == "returned" and a.elapsed_ms is not None
+        ]
+        p50 = _percentile(retrieve_latencies, 0.50)
+        p95 = _percentile(retrieve_latencies, 0.95)
+        if retrieve_latencies:
+            computed(
+                "retrieve_latency_ms_p50",
+                p50,
+                f"成功逻辑检索={len(retrieve_latencies)}",
+            )
+            computed(
+                "retrieve_latency_ms_p95",
+                p95,
+                f"成功逻辑检索={len(retrieve_latencies)}",
+            )
+        else:
+            na("retrieve_latency_ms_p50", "denominator_zero：没有成功的检索")
+            na("retrieve_latency_ms_p95", "denominator_zero：没有成功的检索")
+
+        ordered: list[MetricAggregate] = []
+        for metric_id in FORMAL_METRIC_ORDER:
+            get_metric(metric_id)  # registry guard: only registered ids
+            aggregate = aggregates.get(metric_id)
+            if aggregate is not None:
+                ordered.append(aggregate)
+        return ordered
+
+    def _logical_ingest_latencies(self, results: list[Any]) -> list[float]:
+        latencies: list[float] = []
+        for result in results:
+            current: list[float] | None = None
+            for attempt in result.attempts:
+                if attempt.stage == "ingest":
+                    if current is not None:
+                        latencies.append(sum(current))
+                    current = []
+                if attempt.stage in ("ingest", "await_ready") and current is not None:
+                    if attempt.elapsed_ms is not None:
+                        current.append(attempt.elapsed_ms)
+            if current is not None:
+                latencies.append(sum(current))
+        return latencies
+
+    def _attribution_block(
+        self, results: list[Any], traces: dict[str, Any]
+    ) -> dict[str, Any]:
+        scored_results = [r for r in results if r.qa_status == "scored"]
+
+        def empty() -> dict[str, int]:
+            return {c: 0 for c in ATTRIBUTION_CELLS}
+
+        overall = empty()
+        by_abstention: dict[str, dict[str, int]] = {"true": empty(), "false": empty()}
+        by_type: dict[str, dict[str, int]] = {}
+        for result in scored_results:
+            overall[result.attribution] += 1
+            trace = traces.get(result.sample_handle)
+            if trace is None:
+                continue
+            key = "true" if trace.scoring.is_abstention else "false"
+            by_abstention[key][result.attribution] += 1
+            by_type.setdefault(trace.scoring.question_type, empty())[
+                result.attribution
+            ] += 1
+        scored = len(scored_results)
+        shares = {
+            c: (_round(overall[c] / scored) if scored else None)
+            for c in ATTRIBUTION_CELLS
+        }
+        criteria = sorted(
+            {
+                t.hit_criterion
+                for t in traces.values()
+                if t is not None
+            }
+        )
+        criterion_notes = [HIT_CRITERION_NOTES[c] for c in criteria]
+        excluded = {
+            "failed": sum(1 for r in results if r.qa_status == "failed"),
+            "context_exceeded": sum(
+                1 for r in results if r.qa_status == "context_exceeded"
+            ),
+            "pending": sum(1 for r in results if r.qa_status == "pending"),
+            "invalid_input": sum(
+                1 for r in results if r.qa_status == "invalid_input"
+            ),
+        }
+        return {
+            "scored_denominator": scored,
+            "overall": overall,
+            "shares": shares,
+            "by_abstention": by_abstention,
+            "by_question_type": {
+                qtype: cells for qtype, cells in sorted(by_type.items())
+            },
+            "hit_criteria": criterion_notes,
+            "excluded_from_cells": excluded,
+        }
+
+    def _budget_composition(
+        self, prepared: dict[str, Any], raws: dict[str, Any]
+    ) -> dict[str, Any]:
+        handles = list(self.manifest["sample_ids"])
+        rows: list[dict[str, Any]] = []
+        for handle in handles:
+            raw = raws.get(handle)
+            prep = prepared.get(handle)
+            counting = prep.prepared.counting_mode if prep is not None else None
+            returned = len(raw.evidence) if raw is not None else None
+            retained = len(prep.prepared.items) if prep is not None else None
+            dropped = (
+                len(prep.prepared.dropped_raw_indices) if prep is not None else None
+            )
+            truncated_units = (
+                sum(1 for i in prep.prepared.items if i.truncated)
+                if prep is not None
+                else None
+            )
+            token_count = prep.prepared.token_count if prep is not None else None
+            text_tokens = (
+                prep.prepared.text_token_count if prep is not None else None
+            )
+            format_tokens = (
+                token_count - text_tokens
+                if token_count is not None and text_tokens is not None
+                else None
+            )
+            truncated_removed: int | None = None
+            dropped_text: int | None = None
+            if prep is not None and raw is not None and counting == "test":
+                by_index = {i: ev for i, ev in enumerate(raw.evidence)}
+                truncated_removed = 0
+                for item in prep.prepared.items:
+                    if item.truncated and item.raw_index in by_index:
+                        truncated_removed += len(by_index[item.raw_index].text) - len(
+                            item.evidence.text
+                        )
+                dropped_text = sum(
+                    len(by_index[i].text)
+                    for i in prep.prepared.dropped_raw_indices
+                    if i in by_index
+                )
+            rows.append(
+                {
+                    "sample_handle": handle,
+                    "returned_units": returned,
+                    "retained_units": retained,
+                    "dropped_units": dropped,
+                    "truncated_units": truncated_units,
+                    "token_count": token_count,
+                    "text_tokens": text_tokens,
+                    "format_tokens": format_tokens,
+                    "truncated_removed_tokens": truncated_removed,
+                    "dropped_text_tokens": dropped_text,
+                }
+            )
+
+        def total() -> dict[str, Any]:
+            keys = (
+                "returned_units",
+                "retained_units",
+                "dropped_units",
+                "truncated_units",
+                "token_count",
+                "text_tokens",
+                "format_tokens",
+                "truncated_removed_tokens",
+                "dropped_text_tokens",
+            )
+            totals: dict[str, Any] = {"sample_handle": "TOTAL"}
+            for key in keys:
+                known = [row[key] for row in rows if row[key] is not None]
+                totals[key] = sum(known) if known else None
+            return totals
+
+        first_prep = next((p.prepared for p in prepared.values() if p is not None), None)
+        return {
+            "counting_mode": first_prep.counting_mode if first_prep else None,
+            "tokenizer_id": first_prep.tokenizer_id if first_prep else None,
+            "budget": self.manifest["evidence_token_budget"],
+            "rows": rows,
+            "totals": total(),
+            "note": (
+                "诊断项：adapter 返回条数、进入 Reader 条数、被移除与截断的 "
+                "tokens（test 计数模式按字符计）。失败阶段的样本相应字段为 "
+                "null，不计入合计。碎片化返回的元数据开销见 "
+                "format_tokens。"
+            ),
+        }
+
+    def _cost_model(self, results: list[Any], logs: dict[str, Any]) -> dict[str, Any]:
+        planned: dict[str, int] = {}
+        for counts in self.manifest["plan_counts"].values():
+            for key, value in counts.items():
+                planned[key] = planned.get(key, 0) + value
+        method_entries: dict[str, list[Any]] = {}
+        for log in logs.values():
+            if log is None:
+                continue
+            for entry in log.entries:
+                method_entries.setdefault(entry.method, []).append(entry)
+        interesting = (
+            "ingest",
+            "await_ready",
+            "open",
+            "close",
+            "retrieve",
+            "reader.answer",
+            "judge.evaluate",
+        )
+        unit_costs = []
+        for method in interesting:
+            entries = method_entries.get(method, [])
+            elapsed = [
+                float(e.elapsed_ms) for e in entries if e.elapsed_ms is not None
+            ]
+            inputs = [
+                e.usage.input_tokens
+                for e in entries
+                if e.usage is not None and e.usage.input_tokens is not None
+            ]
+            outputs = [
+                e.usage.output_tokens
+                for e in entries
+                if e.usage is not None and e.usage.output_tokens is not None
+            ]
+            unit_costs.append(
+                {
+                    "method": method,
+                    "call_count": len(entries),
+                    "mean_elapsed_ms": _round(_mean(elapsed), 3),
+                    "mean_input_tokens": _round(_mean([float(v) for v in inputs])),
+                    "mean_output_tokens": _round(_mean([float(v) for v in outputs])),
+                }
+            )
+        actual_calls = {
+            method: len(entries) for method, entries in sorted(method_entries.items())
+        }
+        planned_key_for_method = {
+            "ingest": "ingest_calls",
+            "await_ready": "await_ready_calls",
+            "open": "open_calls",
+            "close": "close_calls",
+            "retrieve": "retrieve_calls",
+            "reader.answer": "reader_calls",
+            "judge.evaluate": "judge_calls",
+        }
+        estimated: dict[str, float] = {}
+        for unit in unit_costs:
+            key = planned_key_for_method[unit["method"]]
+            count = planned.get(key, 0)
+            if unit["mean_elapsed_ms"] is not None:
+                estimated[f"{unit['method']}.elapsed_ms"] = _round(
+                    unit["mean_elapsed_ms"] * count, 3
+                )
+            if unit["mean_input_tokens"] is not None:
+                estimated[f"{unit['method']}.input_tokens"] = _round(
+                    unit["mean_input_tokens"] * count
+                )
+            if unit["mean_output_tokens"] is not None:
+                estimated[f"{unit['method']}.output_tokens"] = _round(
+                    unit["mean_output_tokens"] * count
+                )
+        return {
+            "planned_calls": dict(sorted(planned.items())),
+            "actual_calls": actual_calls,
+            "unit_costs": unit_costs,
+            "estimated_totals": dict(sorted(estimated.items())),
+            "estimated": True,
+            "note": (
+                "planned_calls 是配置的函数（run.json plan_counts 求和）；"
+                "unit_costs 为 fake 路径实测单位成本（均值）；"
+                "estimated_totals = 单位成本 × 计划调用次数，明确为估算值，"
+                "不与实测混写。"
+            ),
+        }
+
+    def _failure_rows(
+        self, results: list[Any], logs: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        rows = []
+        for result in results:
+            if result.qa_status not in ("failed", "invalid_input", "pending"):
+                continue
+            error_code = None
+            error_message = None
+            log = logs.get(result.sample_handle)
+            candidates = []
+            if log is not None:
+                candidates = [
+                    e
+                    for e in log.entries
+                    if e.error is not None
+                    and (e.stage == result.failed_stage or e.method == "dataset.get_scoring_data")
+                ]
+            if candidates:
+                last = candidates[-1]
+                error_code = last.error.code
+                error_message = last.error.message
+            rows.append(
+                {
+                    "sample_handle": result.sample_handle,
+                    "qa_status": result.qa_status,
+                    "failed_stage": result.failed_stage,
+                    "error_code": error_code,
+                    "error_message": error_message,
+                }
+            )
+        return rows
+
+
+# ---------------------------------------------------------------------------
+# Markdown rendering
+# ---------------------------------------------------------------------------
+
+
+def _fmt(value: float | None) -> str:
+    if value is None:
+        return "N/A"
+    text = f"{value:.4f}".rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
+def _table(headers: list[str], rows: list[list[str]]) -> str:
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
+def render_markdown(report: SummaryReport) -> str:
+    header = report["header"]
+    statuses = report["statuses"]
+    lines: list[str] = []
+    lines.append("# Memory Eval 运行汇总报告")
+    lines.append("")
+    lines.append(
+        _table(
+            ["字段", "值"],
+            [
+                ["run ID", header["run_id"]],
+                ["配置", f"{header['config_name']}（指纹 {header['config_fingerprint'][:12]}…）"],
+                ["数据计划", f"{header['dataset_plan']} / {header['sample_plan_id']}"],
+                ["证据预算", f"{header['evidence_token_budget']} tokens（{header['counting_mode']} 计数）"],
+                ["memory", f"{header['memory_name']}（{header['memory_baseline_kind']}）"],
+                ["reader / judge", f"{header['reader_model']} / {header['judge_model']}（协议 {header['judge_protocol_id']}）"],
+                ["指标注册表", f"v{header['metrics_registry_version']}（{header['metrics_registry_content_version']}）"],
+            ],
+        )
+    )
+    lines.append("")
+    lines.append("## 状态计数与分母")
+    lines.append("")
+    failed_stages = ", ".join(
+        f"{stage}={count}" for stage, count in sorted(statuses["failed_stages"].items())
+    ) or "无"
+    lines.append(
+        _table(
+            ["口径", "数量", "说明"],
+            [
+                ["计划题目 |P|", str(statuses["planned"]), "运行前固定的题目集合"],
+                ["scored", str(statuses["scored"]), "回答已成功评分（可对可错）"],
+                ["failed", str(statuses["failed"]), f"失败阶段：{failed_stages}"],
+                ["context_exceeded", str(statuses["context_exceeded"]), "预检不可运行，单列不并入答错"],
+                ["invalid_input", str(statuses["invalid_input"]), "数据校验错误，不静默排除"],
+                ["pending", str(statuses["pending"]), "未到终态（中间进度）"],
+                ["拒答题（计划/已评分）", f"{statuses['abstention_planned']} / {statuses['abstention_scored']}", "recall 为 N/A 但参与回答评分"],
+            ],
+        )
+    )
+    lines.append("")
+    lines.append(f"## 正式指标（指标注册表 v{header['metrics_registry_version']}）")
+    lines.append("")
+    lines.append(
+        _table(
+            ["metric_id", "状态", "数值", "分母 / 说明"],
+            [
+                [
+                    m["metric_id"],
+                    "computed" if m["status"] == "computed" else "N/A",
+                    _fmt(m["value"]) if m["status"] == "computed" else "—",
+                    m["reason"] or m["denominator"],
+                ]
+                for m in report["metrics"]
+            ],
+        )
+    )
+    lines.append("")
+    lines.append("## 检索 × 问答 2×2 联合归因")
+    lines.append("")
+    attribution = report["attribution"]
+    overall = attribution["overall"]
+    shares = attribution["shares"]
+    scored = attribution["scored_denominator"]
+    lines.append(
+        _table(
+            ["", "回答正确", "回答错误"],
+            [
+                [
+                    "证据命中",
+                    f"hit_correct = {overall['hit_correct']}（{_fmt(shares['hit_correct'])}）",
+                    f"hit_wrong = {overall['hit_wrong']}（{_fmt(shares['hit_wrong'])}）",
+                ],
+                [
+                    "证据未命中",
+                    f"miss_correct = {overall['miss_correct']}（{_fmt(shares['miss_correct'])}）",
+                    f"miss_wrong = {overall['miss_wrong']}（{_fmt(shares['miss_wrong'])}）",
+                ],
+            ],
+        )
+    )
+    lines.append("")
+    lines.append(f"分母：scored={scored}。命中口径：" + "；".join(attribution["hit_criteria"]))
+    excluded = attribution["excluded_from_cells"]
+    excluded_text = ", ".join(f"{k}={v}" for k, v in excluded.items() if v) or "无"
+    lines.append("不进四格的状态（单列，不并入答错）：" + excluded_text)
+    lines.append("")
+    by_abstention = attribution["by_abstention"]
+    lines.append(
+        _table(
+            ["子集", "hit_correct", "hit_wrong", "miss_correct", "miss_wrong"],
+            [
+                [
+                    "拒答题",
+                    str(by_abstention["true"]["hit_correct"]),
+                    str(by_abstention["true"]["hit_wrong"]),
+                    str(by_abstention["true"]["miss_correct"]),
+                    str(by_abstention["true"]["miss_wrong"]),
+                ],
+                [
+                    "非拒答题",
+                    str(by_abstention["false"]["hit_correct"]),
+                    str(by_abstention["false"]["hit_wrong"]),
+                    str(by_abstention["false"]["miss_correct"]),
+                    str(by_abstention["false"]["miss_wrong"]),
+                ],
+                *[
+                    [
+                        qtype,
+                        str(cells["hit_correct"]),
+                        str(cells["hit_wrong"]),
+                        str(cells["miss_correct"]),
+                        str(cells["miss_wrong"]),
+                    ]
+                    for qtype, cells in attribution["by_question_type"].items()
+                ],
+            ],
+        )
+    )
+    lines.append("")
+    lines.append("## 证据预算构成（诊断）")
+    budget = report["budget"]
+    lines.append("")
+    lines.append(
+        f"计数模式 {budget['counting_mode']}（tokenizer {budget['tokenizer_id']}），"
+        f"预算 {budget['budget']} tokens。{budget['note']}"
+    )
+    lines.append("")
+    rows = budget["rows"] + [budget["totals"]]
+    lines.append(
+        _table(
+            [
+                "样本",
+                "返回",
+                "进 Reader",
+                "移除",
+                "截断单元",
+                "总 tokens",
+                "文本 tokens",
+                "格式 tokens",
+                "截断移除",
+                "移除文本",
+            ],
+            [
+                [
+                    row["sample_handle"],
+                    *("—" if row[k] is None else str(row[k]) for k in (
+                        "returned_units",
+                        "retained_units",
+                        "dropped_units",
+                        "truncated_units",
+                        "token_count",
+                        "text_tokens",
+                        "format_tokens",
+                        "truncated_removed_tokens",
+                        "dropped_text_tokens",
+                    )),
+                ]
+                for row in rows
+            ],
+        )
+    )
+    lines.append("")
+    lines.append("## 规模与成本模型")
+    cost = report["cost_model"]
+    lines.append("")
+    lines.append(cost["note"])
+    lines.append("")
+    planned = cost["planned_calls"]
+    actual = cost["actual_calls"]
+    lines.append(
+        _table(
+            ["调用", "计划次数", "实际次数"],
+            [
+                [method, str(planned.get(key, 0)), str(actual.get(method, 0))]
+                for method, key in (
+                    ("ingest", "ingest_calls"),
+                    ("await_ready", "await_ready_calls"),
+                    ("open", "open_calls"),
+                    ("close", "close_calls"),
+                    ("retrieve", "retrieve_calls"),
+                    ("reader.answer", "reader_calls"),
+                    ("judge.evaluate", "judge_calls"),
+                )
+            ],
+        )
+    )
+    lines.append("")
+    lines.append(
+        _table(
+            ["方法", "调用数", "均耗时 ms", "均输入 tokens", "均输出 tokens"],
+            [
+                [
+                    unit["method"],
+                    str(unit["call_count"]),
+                    _fmt(unit["mean_elapsed_ms"]),
+                    _fmt(unit["mean_input_tokens"]),
+                    _fmt(unit["mean_output_tokens"]),
+                ]
+                for unit in cost["unit_costs"]
+            ],
+        )
+    )
+    lines.append("")
+    lines.append("外推总量（估算 = 单位成本 × 计划次数）：")
+    lines.append("")
+    lines.append(
+        _table(
+            ["项", "估算值"],
+            [[key, _fmt(value)] for key, value in cost["estimated_totals"].items()],
+        )
+    )
+    if report["failures"]:
+        lines.append("")
+        lines.append("## 失败与无效样本")
+        lines.append("")
+        lines.append(
+            _table(
+                ["样本", "状态", "失败阶段", "错误码", "错误信息"],
+                [
+                    [
+                        row["sample_handle"],
+                        row["qa_status"],
+                        row["failed_stage"] or "—",
+                        row["error_code"] or "—",
+                        row["error_message"] or "—",
+                    ]
+                    for row in report["failures"]
+                ],
+            )
+        )
+    lines.append("")
+    lines.append("## 限制")
+    lines.append("")
+    for note in report["limitations"]:
+        lines.append(f"- {note}")
+    lines.append("")
+    return "\n".join(lines)

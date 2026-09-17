@@ -48,6 +48,7 @@ from eval.contracts.internal import (
     RawEvidenceArtifact,
     ReaderResultArtifact,
     ResultArtifact,
+    ScoringTraceArtifact,
 )
 
 #: Fixture kind -> artifact model (each carries schema_version=1 on dump).
@@ -56,6 +57,7 @@ ARTIFACT_MODELS: dict[str, type] = {
     "prepared_evidence": PreparedEvidenceArtifact,
     "reader_result": ReaderResultArtifact,
     "judge_record": JudgeRecordArtifact,
+    "scoring_trace": ScoringTraceArtifact,
     "result": ResultArtifact,
 }
 
