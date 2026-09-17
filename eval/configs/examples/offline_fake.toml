@@ -1,0 +1,70 @@
+# M1 offline fake experiment config.
+# Uses fake memory/reader/judge only; no external model is contacted.
+# The smoke subset is fixed at 8 questions: one per question_type plus two
+# abstention samples (see docs/design/eval-harness.md, M1 row).
+
+name = "offline-fake-smoke"
+dataset_plan = "manual-fixtures@1"
+sample_plan_id = "smoke-offline-8"
+sample_ids = [
+  "smoke_single_session_user_0001",
+  "smoke_single_session_assistant_0001",
+  "smoke_single_session_preference_0001",
+  "smoke_temporal_reasoning_0001",
+  "smoke_knowledge_update_0001",
+  "smoke_multi_session_0001",
+  "smoke_abstention_0001",
+  "smoke_abstention_0002",
+]
+smoke_subset_ids = [
+  "smoke_single_session_user_0001",
+  "smoke_single_session_assistant_0001",
+  "smoke_single_session_preference_0001",
+  "smoke_temporal_reasoning_0001",
+  "smoke_knowledge_update_0001",
+  "smoke_multi_session_0001",
+  "smoke_abstention_0001",
+  "smoke_abstention_0002",
+]
+evidence_token_budget = 4096
+notes = "M1 offline scaffold config; fake components only, smoke subset fixed."
+
+[memory]
+name = "fake-memory"
+baseline_kind = "adapter"
+capabilities = [
+  "extractive_evidence",
+  "generated_evidence",
+  "state_inspection",
+  "auto_update",
+  "update",
+  "delete",
+  "idempotent_mutation",
+  "operation_status",
+]
+
+[memory.config]
+store = "in-memory"
+
+[reader]
+model = "fake-reader"
+model_family = "fake-reader-family"
+base_url = "offline://fake"
+temperature = 0.0
+max_output_tokens = 1024
+tokenizer_id = "test:char-v1"
+counting_mode = "test"
+
+[judge]
+model = "fake-judge"
+model_family = "fake-judge-family"
+base_url = "offline://fake"
+temperature = 0.0
+protocol_id = "longmemeval-yes-no@1"
+protocol_source_commit = "0000000000000000000000000000000000000000"
+
+[run_params]
+max_retries = 3
+backoff_base_s = 1.0
+await_ready_timeout_s = 300.0
+question_concurrency = 1

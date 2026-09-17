@@ -1,0 +1,36 @@
+# Invalid on purpose: reader and judge share a model family.
+name = "invalid-same-family"
+dataset_plan = "manual-fixtures@1"
+sample_plan_id = "smoke-offline-8"
+sample_ids = [
+  "smoke_single_session_user_0001",
+  "smoke_single_session_assistant_0001",
+  "smoke_single_session_preference_0001",
+  "smoke_temporal_reasoning_0001",
+  "smoke_knowledge_update_0001",
+  "smoke_multi_session_0001",
+  "smoke_abstention_0001",
+  "smoke_abstention_0002",
+]
+
+[memory]
+name = "fake-memory"
+baseline_kind = "adapter"
+capabilities = ["extractive_evidence"]
+
+[reader]
+model = "fake-reader"
+model_family = "shared-family"
+base_url = "offline://fake"
+temperature = 0.0
+max_output_tokens = 1024
+tokenizer_id = "test:char-v1"
+counting_mode = "test"
+
+[judge]
+model = "fake-judge"
+model_family = "shared-family"
+base_url = "offline://fake"
+temperature = 0.0
+protocol_id = "longmemeval-yes-no@1"
+protocol_source_commit = "0000000000000000000000000000000000000000"
