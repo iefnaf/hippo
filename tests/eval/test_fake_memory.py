@@ -306,6 +306,408 @@ class TestInspect:
         adapter.close("ns")
 
 
+class TestAutoUpdateCapability:
+    def _adapter(self, auto_update: bool) -> FakeMemoryAdapter:
+        adapter = FakeMemoryAdapter(FakeMemorySpec(auto_update=auto_update))
+        adapter.reset("ns")
+        adapter.open("ns")
+        return adapter
+
+    def test_capability_declared(self):
+        caps = FakeMemorySpec(auto_update=True).capabilities()
+        assert "auto_update" in caps
+        assert "auto_update" not in FakeMemorySpec().capabilities()
+
+    def test_new_convention_supersedes_old(self):
+        adapter = self._adapter(True)
+        old = adapter.ingest(
+            "ns",
+            Session(
+                session_id="s1",
+                occurred_at="2026-09-01",
+                messages=[Message(msg_id="m1", role="user", content="包管理器约定：使用 npm。")],
+            ),
+            "op-1",
+        )
+        new = adapter.ingest(
+            "ns",
+            Session(
+                session_id="s2",
+                occurred_at="2026-09-03",
+                messages=[
+                    Message(msg_id="m2", role="user", content="包管理器约定：迁移到 pnpm，以后都用 pnpm。")
+                ],
+            ),
+            "op-2",
+        )
+        old_id, new_id = old.memory_ids[0], new.memory_ids[0]
+        (old_state, new_state) = adapter.inspect("ns", [old_id, new_id])
+        assert new_state.validity == "current"
+        assert old_state.validity == "superseded"
+        assert old_state.superseded_by == [new_id]
+        # The old value is retained, not dropped.
+        assert old_state.content == "包管理器约定：使用 npm。"
+        adapter.close("ns")
+
+    def test_superseded_state_survives_close_and_reopen(self):
+        adapter = self._adapter(True)
+        old = adapter.ingest(
+            "ns",
+            Session(
+                session_id="s1", occurred_at="2026-09-01",
+                messages=[Message(msg_id="m1", role="user", content="主题：旧值。")],
+            ),
+            "op-1",
+        )
+        new = adapter.ingest(
+            "ns",
+            Session(
+                session_id="s2", occurred_at="2026-09-03",
+                messages=[Message(msg_id="m2", role="user", content="主题：新值。")],
+            ),
+            "op-2",
+        )
+        adapter.close("ns")
+        adapter.open("ns")
+        old_state, new_state = adapter.inspect(
+            "ns", [old.memory_ids[0], new.memory_ids[0]]
+        )
+        assert new_state.validity == "current"
+        assert old_state.validity == "superseded"
+        assert old_state.superseded_by == [new.memory_ids[0]]
+        adapter.close("ns")
+
+    def test_no_auto_update_both_stay_current(self):
+        adapter = self._adapter(False)
+        adapter.ingest(
+            "ns",
+            Session(
+                session_id="s1", occurred_at="2026-09-01",
+                messages=[Message(msg_id="m1", role="user", content="主题：旧值。")],
+            ),
+            "op-1",
+        )
+        adapter.ingest(
+            "ns",
+            Session(
+                session_id="s2", occurred_at="2026-09-03",
+                messages=[Message(msg_id="m2", role="user", content="主题：新值。")],
+            ),
+            "op-2",
+        )
+        space = adapter._spaces["ns"]
+        assert all(m.validity == "current" for m in space.values())
+        adapter.close("ns")
+
+    def test_different_topics_never_supersede(self):
+        adapter = self._adapter(True)
+        adapter.ingest(
+            "ns",
+            Session(
+                session_id="s1", occurred_at="2026-09-01",
+                messages=[Message(msg_id="m1", role="user", content="主题甲：值一。")],
+            ),
+            "op-1",
+        )
+        adapter.ingest(
+            "ns",
+            Session(
+                session_id="s2", occurred_at="2026-09-03",
+                messages=[Message(msg_id="m2", role="user", content="主题乙：值二。")],
+            ),
+            "op-2",
+        )
+        space = adapter._spaces["ns"]
+        assert all(m.validity == "current" for m in space.values())
+        adapter.close("ns")
+
+    def test_markerless_content_never_supersedes(self):
+        adapter = self._adapter(True)
+        adapter.ingest(
+            "ns",
+            Session(
+                session_id="s1", occurred_at="2026-09-01",
+                messages=[Message(msg_id="m1", role="user", content="项目使用 npm。")],
+            ),
+            "op-1",
+        )
+        adapter.ingest(
+            "ns",
+            Session(
+                session_id="s2", occurred_at="2026-09-03",
+                messages=[Message(msg_id="m2", role="user", content="迁移到 pnpm，以后都用 pnpm。")],
+            ),
+            "op-2",
+        )
+        space = adapter._spaces["ns"]
+        assert all(m.validity == "current" for m in space.values())
+        adapter.close("ns")
+
+    def test_current_ranks_above_superseded_in_retrieval(self):
+        adapter = self._adapter(True)
+        adapter.ingest(
+            "ns",
+            Session(
+                session_id="s1", occurred_at="2026-09-01",
+                messages=[Message(msg_id="m1", role="user", content="包管理器约定：使用 npm。")],
+            ),
+            "op-1",
+        )
+        adapter.ingest(
+            "ns",
+            Session(
+                session_id="s2", occurred_at="2026-09-03",
+                messages=[
+                    Message(msg_id="m2", role="user", content="包管理器约定：迁移到 pnpm，以后都用 pnpm。")
+                ],
+            ),
+            "op-2",
+        )
+        evidence = adapter.retrieve("ns", make_request("包管理器约定是什么"))
+        extractive = [e for e in evidence if e.kind == "extractive"]
+        assert extractive[0].text == "包管理器约定：迁移到 pnpm，以后都用 pnpm。"
+        # The superseded old value remains retrievable as history.
+        assert any(e.text == "包管理器约定：使用 npm。" for e in extractive)
+        adapter.close("ns")
+
+
+class TestUpdateCapability:
+    def _prepared(self, **spec_kwargs) -> FakeMemoryAdapter:
+        spec = FakeMemorySpec(update=True, **spec_kwargs)
+        adapter = FakeMemoryAdapter(spec)
+        adapter.reset("ns")
+        adapter.open("ns")
+        return adapter
+
+    def _ingest_one(self, adapter: FakeMemoryAdapter, content: str, op: str, sid: str, date: str) -> str:
+        receipt = adapter.ingest(
+            "ns",
+            Session(
+                session_id=sid,
+                occurred_at=date,
+                messages=[Message(msg_id="m1", role="user", content=content)],
+            ),
+            op,
+        )
+        if receipt.status == "accepted":
+            receipt = adapter.await_ready("ns", op, 1.0)
+        assert receipt.status == "completed"
+        return receipt.memory_ids[0]
+
+    def test_capability_declared(self):
+        caps = FakeMemorySpec(update=True).capabilities()
+        assert "update" in caps and "update" not in FakeMemorySpec().capabilities()
+
+    def test_update_replaces_content_and_is_current(self):
+        adapter = self._prepared()
+        target = self._ingest_one(adapter, "部署约定：跑 uv run pytest 再发布。", "op-1", "s1", "2026-09-02")
+        receipt = adapter.update("ns", target, "部署约定：用 ruff。", "op-2")
+        assert receipt.status == "completed"
+        assert receipt.memory_ids == [target]
+        assert receipt.sources == []  # replacement carries no new sources
+        (state,) = adapter.inspect("ns", [target])
+        assert state.content == "部署约定：用 ruff。"
+        assert state.validity == "current"
+        assert state.superseded_by == []
+        adapter.close("ns")
+
+    def test_update_without_capability_rejected(self):
+        adapter = FakeMemoryAdapter(FakeMemorySpec())
+        adapter.reset("ns")
+        adapter.open("ns")
+        with pytest.raises(MemoryAdapterError) as excinfo:
+            adapter.update("ns", "mem_x", "文本", "op-1")
+        assert excinfo.value.code == "capability_not_declared"
+        adapter.close("ns")
+
+    def test_update_unknown_memory_id_rejected(self):
+        adapter = self._prepared()
+        with pytest.raises(MemoryAdapterError) as excinfo:
+            adapter.update("ns", "mem_missing", "文本", "op-1")
+        assert excinfo.value.code == "unknown_memory_id"
+        adapter.close("ns")
+
+    def test_update_async_awaits_completed(self):
+        adapter = self._prepared(mutation_mode="async")
+        target = self._ingest_one(adapter, "主题：旧。", "op-1", "s1", "2026-09-01")
+        assert adapter.update("ns", target, "主题：新。", "op-2").status == "accepted"
+        final = adapter.await_ready("ns", "op-2", 1.0)
+        assert final.status == "completed"
+        assert final.memory_ids == [target]
+        (state,) = adapter.inspect("ns", [target])
+        assert state.content == "主题：新。"
+        adapter.close("ns")
+
+    def test_update_idempotent_replay_returns_terminal_receipt(self):
+        adapter = self._prepared(idempotent=True)
+        target = self._ingest_one(adapter, "主题：旧。", "op-1", "s1", "2026-09-01")
+        first = adapter.update("ns", target, "主题：新。", "op-2")
+        second = adapter.update("ns", target, "主题：新。", "op-2")
+        assert first is second
+        with pytest.raises(MemoryAdapterError) as excinfo:
+            adapter.update("ns", target, "主题：别的。", "op-2")
+        assert excinfo.value.code == "operation_id_input_conflict"
+        adapter.close("ns")
+
+    def test_update_retains_old_as_superseded(self):
+        adapter = self._prepared(update_retains_old=True)
+        target = self._ingest_one(adapter, "部署约定：跑 uv run pytest 再发布。", "op-1", "s1", "2026-09-02")
+        receipt = adapter.update("ns", target, "部署约定：用 ruff。", "op-2")
+        assert len(receipt.memory_ids) == 2
+        retained = receipt.memory_ids[1]
+        target_state, retained_state = adapter.inspect("ns", [target, retained])
+        assert target_state.validity == "current"
+        assert target_state.content == "部署约定：用 ruff。"
+        assert retained_state.validity == "superseded"
+        assert retained_state.content == "部署约定：跑 uv run pytest 再发布。"
+        assert retained_state.superseded_by == [target]
+        adapter.close("ns")
+
+    def test_updated_entry_returns_generated_evidence(self):
+        # The updated text no longer matches any cleaned span, so it must
+        # not be returned as extractive evidence.
+        adapter = self._prepared()
+        target = self._ingest_one(adapter, "部署约定：跑 uv run pytest。", "op-1", "s1", "2026-09-02")
+        adapter.update("ns", target, "部署约定：用 ruff，全新流程。", "op-2")
+        evidence = adapter.retrieve("ns", make_request("部署约定 流程"))
+        assert evidence
+        for ev in evidence:
+            if "ruff" in ev.text:
+                assert ev.kind == "generated"
+                assert ev.extractive_span is None
+                assert ev.derivation_sources  # original source as reference
+        adapter.close("ns")
+
+    def test_update_retains_old_requires_update(self):
+        with pytest.raises(Exception):
+            FakeMemorySpec(update_retains_old=True)
+
+
+class TestDeleteCapability:
+    def _prepared(self, **spec_kwargs) -> FakeMemoryAdapter:
+        spec = FakeMemorySpec(delete=True, **spec_kwargs)
+        adapter = FakeMemoryAdapter(spec)
+        adapter.reset("ns")
+        adapter.open("ns")
+        return adapter
+
+    def _ingest_one(self, adapter: FakeMemoryAdapter, content: str, op: str, sid: str, date: str) -> str:
+        receipt = adapter.ingest(
+            "ns",
+            Session(
+                session_id=sid,
+                occurred_at=date,
+                messages=[Message(msg_id="m1", role="user", content=content)],
+            ),
+            op,
+        )
+        if receipt.status == "accepted":
+            receipt = adapter.await_ready("ns", op, 1.0)
+        assert receipt.status == "completed"
+        return receipt.memory_ids[0]
+
+    def test_capability_declared(self):
+        caps = FakeMemorySpec(delete=True).capabilities()
+        assert "delete" in caps and "delete" not in FakeMemorySpec().capabilities()
+
+    def test_delete_removes_from_retrieval_and_tombstones(self):
+        adapter = self._prepared(evidence_kinds=("extractive", "generated"))
+        target = self._ingest_one(adapter, "缓存约定：30 秒过期，Redis 统一。", "op-1", "s1", "2026-09-04")
+        self._ingest_one(adapter, "无关事实：站会改到每周四上午。", "op-2", "s2", "2026-09-05")
+        receipt = adapter.delete("ns", target, "op-3")
+        assert receipt.status == "completed"
+        assert receipt.memory_ids == [target]
+
+        gone = adapter.retrieve("ns", make_request("缓存约定 过期时间"))
+        assert all("30 秒过期" not in e.text for e in gone)  # no extractive recall
+        assert all("30 秒过期" not in e.text for e in gone)  # no summary recall either
+        (state,) = adapter.inspect("ns", [target])
+        assert state.validity == "deleted"
+        assert state.content is None
+
+        kept = adapter.retrieve("ns", make_request("站会 时间"))
+        assert any("站会" in e.text for e in kept)
+        adapter.close("ns")
+
+    def test_delete_without_capability_rejected(self):
+        adapter = FakeMemoryAdapter(FakeMemorySpec())
+        adapter.reset("ns")
+        adapter.open("ns")
+        with pytest.raises(MemoryAdapterError) as excinfo:
+            adapter.delete("ns", "mem_x", "op-1")
+        assert excinfo.value.code == "capability_not_declared"
+        adapter.close("ns")
+
+    def test_delete_unknown_memory_id_rejected(self):
+        adapter = self._prepared()
+        with pytest.raises(MemoryAdapterError) as excinfo:
+            adapter.delete("ns", "mem_missing", "op-1")
+        assert excinfo.value.code == "unknown_memory_id"
+        adapter.close("ns")
+
+    def test_delete_survives_close_and_reopen(self):
+        adapter = self._prepared()
+        target = self._ingest_one(adapter, "缓存约定：30 秒过期。", "op-1", "s1", "2026-09-04")
+        adapter.delete("ns", target, "op-2")
+        adapter.close("ns")
+        adapter.open("ns")
+        evidence = adapter.retrieve("ns", make_request("缓存约定 过期时间"))
+        assert all("30 秒过期" not in e.text for e in evidence)
+        (state,) = adapter.inspect("ns", [target])
+        assert state.validity == "deleted"
+        adapter.close("ns")
+
+    def test_reset_clears_tombstones(self):
+        adapter = self._prepared()
+        target = self._ingest_one(adapter, "缓存约定：30 秒过期。", "op-1", "s1", "2026-09-04")
+        adapter.delete("ns", target, "op-2")
+        adapter.close("ns")
+        adapter.reset("ns")
+        adapter.open("ns")
+        (state,) = adapter.inspect("ns", [target])
+        assert state.validity == "unknown"  # a fresh space never knew this id
+        adapter.close("ns")
+
+    def test_delete_async_awaits_completed(self):
+        adapter = self._prepared(mutation_mode="async")
+        target = self._ingest_one(adapter, "主题：删除我。", "op-1", "s1", "2026-09-01")
+        assert adapter.delete("ns", target, "op-2").status == "accepted"
+        assert adapter.await_ready("ns", "op-2", 1.0).status == "completed"
+        assert adapter.stored_message_count("ns") == 0
+        adapter.close("ns")
+
+
+class TestStateReturnsUnknown:
+    def test_declared_capability_but_unknown_states(self):
+        spec = FakeMemorySpec(
+            state_returns_unknown=True,
+            update=True,
+            auto_update=True,
+            delete=True,
+        )
+        adapter = FakeMemoryAdapter(spec)
+        assert "state_inspection" in adapter.capabilities()
+        adapter.reset("ns")
+        adapter.open("ns")
+        receipt = adapter.ingest(
+            "ns",
+            Session(
+                session_id="s1", occurred_at="2026-09-01",
+                messages=[Message(msg_id="m1", role="user", content="主题：值。")],
+            ),
+            "op-1",
+        )
+        (state,) = adapter.inspect("ns", list(receipt.memory_ids))
+        assert state.validity == "unknown"
+        assert state.content is None
+        assert state.superseded_by is None
+        adapter.close("ns")
+
+    def test_requires_state_inspection(self):
+        with pytest.raises(Exception):
+            FakeMemorySpec(state_inspection=False, state_returns_unknown=True)
+
+
 class TestUsageReporting:
     def test_usage_reported_through_contextvar(self):
         adapter = FakeMemoryAdapter(FakeMemorySpec())

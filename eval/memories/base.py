@@ -4,9 +4,13 @@ The protocol mirrors docs/design/eval-harness.md, section Memory Adapter:
 capabilities() declares the fixed capability set before a run; reset/
 open/close manage the per-sample isolated space; ingest writes exactly
 one session; retrieve is read-only; await_ready is provided by async
-adapters (sync adapters return completed receipts directly); inspect is
-the only state-observation channel. update/delete land with the M1
-operations-capability suite.
+adapters (sync adapters return completed receipts directly); update and
+delete are the explicit operations exercised by the operations suite;
+inspect is the only state-observation channel.
+
+update/delete are the explicit operations of the M1 operations suite;
+inspect is the only state-observation channel and must answer by stable
+memory id (a missing row may never replace a definite state).
 
 Adapters raise MemoryAdapterError for protocol violations and backend
 failures; the runner converts them into structured ErrorInfo attempt
