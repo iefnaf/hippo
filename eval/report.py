@@ -686,6 +686,68 @@ class Reporter:
             ),
         }
 
+    def _usage_split(self, logs: dict[str, Any]) -> dict[str, Any]:
+        """Usage by attempt kind: logical vs recovery, both in totals.
+
+        Retry and replay (including resume re-runs) resource consumption
+        counts into the run TOTAL and is reported SEPARATELY from the
+        logical operation usage (issue #5 AC5). Unknown quantities stay
+        unknown: a bucket sums only reported values and also reports how
+        many attempts carried usage at all.
+        """
+
+        class _Agg:
+            def __init__(self) -> None:
+                self.attempts = 0
+                self.with_usage = 0
+                self.input_tokens = 0
+                self.output_tokens = 0
+                self.llm_calls = 0
+
+            def add(self, usage: Any) -> None:
+                self.attempts += 1
+                if usage is None:
+                    return
+                self.with_usage += 1
+                if usage.input_tokens is not None:
+                    self.input_tokens += usage.input_tokens
+                if usage.output_tokens is not None:
+                    self.output_tokens += usage.output_tokens
+                if usage.llm_call_count is not None:
+                    self.llm_calls += usage.llm_call_count
+
+        buckets = {"logical": _Agg(), "retry": _Agg(), "replay": _Agg()}
+        total = _Agg()
+        for log in logs.values():
+            if log is None:
+                continue
+            for entry in log.entries:
+                kind = getattr(entry, "attempt_kind", "logical") or "logical"
+                bucket = buckets.get(kind, buckets["logical"])
+                bucket.add(entry.usage)
+                total.add(entry.usage)
+
+        def render(agg: _Agg) -> dict[str, Any]:
+            return {
+                "attempts": agg.attempts,
+                "attempts_with_usage": agg.with_usage,
+                "input_tokens": agg.input_tokens,
+                "output_tokens": agg.output_tokens,
+                "llm_call_count": agg.llm_calls,
+            }
+
+        return {
+            "logical": render(buckets["logical"]),
+            "retry": render(buckets["retry"]),
+            "replay": render(buckets["replay"]),
+            "total": render(total),
+            "note": (
+                "logical=按计划首次执行的调用；retry=有限重试；replay=隔离重放"
+                "与断点补跑；total=run 总量（logical+retry+replay）。"
+                "未上报用量的尝试只计入 attempts，不补零。"
+            ),
+        }
+
     def _cost_model(self, results: list[Any], logs: dict[str, Any]) -> dict[str, Any]:
         planned: dict[str, int] = {}
         for counts in self.manifest["plan_counts"].values():
@@ -734,6 +796,7 @@ class Reporter:
         actual_calls = {
             method: len(entries) for method, entries in sorted(method_entries.items())
         }
+        usage_totals = self._usage_split(logs)
         planned_key_for_method = {
             "ingest": "ingest_calls",
             "await_ready": "await_ready_calls",
@@ -764,6 +827,7 @@ class Reporter:
             "actual_calls": actual_calls,
             "unit_costs": unit_costs,
             "estimated_totals": dict(sorted(estimated.items())),
+            "usage_totals": usage_totals,
             "estimated": True,
             "note": (
                 "planned_calls 是配置的函数（run.json plan_counts 求和）；"
@@ -1041,6 +1105,33 @@ def render_markdown(report: SummaryReport) -> str:
             [[key, _fmt(value)] for key, value in cost["estimated_totals"].items()],
         )
     )
+    lines.append("")
+    lines.append("用量拆分（重试与重放计入 total 并单列）：")
+    lines.append("")
+    usage = report["cost_model"]["usage_totals"]
+    lines.append(
+        _table(
+            ["类别", "尝试数", "有用量尝试", "输入 tokens", "输出 tokens", "LLM 调用"],
+            [
+                [
+                    label,
+                    str(bucket["attempts"]),
+                    str(bucket["attempts_with_usage"]),
+                    _fmt(bucket["input_tokens"]),
+                    _fmt(bucket["output_tokens"]),
+                    _fmt(bucket["llm_call_count"]),
+                ]
+                for label, bucket in (
+                    ("logical（按计划首次调用）", usage["logical"]),
+                    ("retry（有限重试）", usage["retry"]),
+                    ("replay（隔离重放/断点补跑）", usage["replay"]),
+                    ("total（run 总量）", usage["total"]),
+                )
+            ],
+        )
+    )
+    lines.append("")
+    lines.append(usage["note"])
     if report["failures"]:
         lines.append("")
         lines.append("## 失败与无效样本")
