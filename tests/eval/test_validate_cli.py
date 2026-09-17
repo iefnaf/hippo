@@ -12,6 +12,7 @@ import json
 import pytest
 
 from eval.cli import main
+from eval.config import load_config_toml
 from eval.validate import validate_config, validate_fixture
 
 EXEMPLAR_DIR = "eval/fixtures/manual"
@@ -205,12 +206,16 @@ class TestOtherCommands:
         assert "config_validation" in err
 
     def test_resume_offline(self, capsys):
-        code, out = run_cli(
-            "resume", "--config", "eval/configs/examples/offline_fake.toml",
-            capsys=capsys,
-        )
-        assert code == 0
-        assert "config_fingerprint" in json.loads(out)
+        # resume is wired to run directories now: --run is required and
+        # the offline plan-only stub is gone (issue #5).
+        with pytest.raises(SystemExit) as excinfo:
+            run_cli(
+                "resume", "--config", "eval/configs/examples/offline_fake.toml",
+                capsys=capsys,
+            )
+        assert excinfo.value.code == 2
+        config = load_config_toml("eval/configs/examples/offline_fake.toml")
+        assert len(config.fingerprint()) == 64
 
 
 class TestProjectStructure:

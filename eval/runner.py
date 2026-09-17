@@ -1153,7 +1153,8 @@ class OfflineRunner(RunnerBase):
             except _StageFailure as exc:
                 failed_stage = exc.stage
                 failure = exc.error
-                stage_states[exc.stage] = "failed"
+                if exc.stage in stage_states:
+                    stage_states[exc.stage] = "failed"
         elif resume is not None and resume.saved_prepared is None:
             # Failed at prepare with the raw return already saved: re-run
             # the deterministic preparation only; no adapter calls.
@@ -1253,7 +1254,7 @@ class OfflineRunner(RunnerBase):
             if scoring is not None and scoring.judge_attempts:
                 for idx, call in enumerate(scoring.judge_attempts):
                     attempt_id = self._next_attempt_id("judge")
-                    kind = "logical" if idx == 0 else "retry"
+                    kind = base_kind if idx == 0 else "retry"
                     attempts.append(
                         StageAttempt(
                             attempt_id=attempt_id,
