@@ -1,0 +1,350 @@
+{
+  "_comment": "人工污染样本（上游形态）：session 级 answer 字段、消息级 has_answer、answer_ 前缀会话 ID、question 级 answer_session_ids/evidence_session_ids、拒答题 _abs 后缀。清洗后这些标记只能留在 harness 私有评分视图。",
+  "samples": [
+    {
+      "question_id": "smoke_single_session_user_0001",
+      "question_type": "single-session-user",
+      "question": "这个项目现在使用什么包管理器？",
+      "question_date": "2026-09-06",
+      "answer": "pnpm",
+      "answer_session_ids": [
+        "session_12_answer_7ab9"
+      ],
+      "evidence_session_ids": [
+        "session_11_answer_4d02",
+        "session_12_answer_7ab9"
+      ],
+      "sessions": [
+        {
+          "session_id": "session_10_haystack_9c31",
+          "date": "2026-08-30",
+          "summary": "README 更新讨论",
+          "messages": [
+            {
+              "role": "user",
+              "content": "帮我看一下 README 里的安装说明。",
+              "has_answer": false
+            },
+            {
+              "role": "assistant",
+              "content": "安装说明已更新，补上了本地开发一节。",
+              "has_answer": false
+            }
+          ]
+        },
+        {
+          "session_id": "session_11_answer_4d02",
+          "date": "2026-09-01",
+          "answer": "项目使用 npm。",
+          "messages": [
+            {
+              "role": "user",
+              "content": "项目使用 npm。",
+              "has_answer": true
+            }
+          ]
+        },
+        {
+          "session_id": "session_12_answer_7ab9",
+          "date": "2026-09-03",
+          "answer": "迁移到 pnpm，以后都用 pnpm。",
+          "messages": [
+            {
+              "role": "user",
+              "content": "迁移到 pnpm，以后都用 pnpm。",
+              "has_answer": true
+            }
+          ]
+        },
+        {
+          "session_id": "session_13_haystack_2f8e",
+          "date": "2026-09-05",
+          "messages": [
+            {
+              "role": "user",
+              "content": "CI 和本地都已完成迁移。",
+              "has_answer": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "question_id": "smoke_single_session_assistant_0001",
+      "question_type": "single-session-assistant",
+      "question": "部署步骤的第一步是什么？",
+      "question_date": "2026-09-05",
+      "answer": "运行 uv run pytest",
+      "answer_session_ids": [
+        "session_20_answer_51cc"
+      ],
+      "evidence_session_ids": [
+        "session_20_answer_51cc"
+      ],
+      "sessions": [
+        {
+          "session_id": "session_20_answer_51cc",
+          "date": "2026-09-02",
+          "answer": "部署步骤：第一步运行 uv run pytest。",
+          "messages": [
+            {
+              "role": "user",
+              "content": "上线前要做哪些检查？给我一个清单。",
+              "has_answer": true
+            },
+            {
+              "role": "assistant",
+              "content": "部署步骤：第一步运行 uv run pytest；第二步构建镜像；第三步滚动发布并观察五分钟。",
+              "has_answer": true
+            }
+          ]
+        },
+        {
+          "session_id": "session_21_haystack_88d1",
+          "date": "2026-09-04",
+          "messages": [
+            {
+              "role": "user",
+              "content": "把这次的检查清单归档到运维手册。",
+              "has_answer": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "question_id": "smoke_single_session_preference_0001",
+      "question_type": "single-session-preference",
+      "question": "我喜欢用哪个编辑器？",
+      "question_date": "2026-09-07",
+      "answer": "Neovim",
+      "answer_session_ids": [
+        "session_31_answer_9e44"
+      ],
+      "evidence_session_ids": [
+        "session_31_answer_9e44"
+      ],
+      "sessions": [
+        {
+          "session_id": "session_30_haystack_3b7a",
+          "date": "2026-09-01",
+          "messages": [
+            {
+              "role": "user",
+              "content": "帮我装一下终端里的几个小工具。",
+              "has_answer": false
+            }
+          ]
+        },
+        {
+          "session_id": "session_31_answer_9e44",
+          "date": "2026-09-02",
+          "answer": "以后编辑器就用 Neovim。",
+          "messages": [
+            {
+              "role": "user",
+              "content": "试用了一圈编辑器，我最后还是喜欢 Neovim，以后就用 Neovim。",
+              "has_answer": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "question_id": "smoke_temporal_reasoning_0001",
+      "question_type": "temporal-reasoning",
+      "question": "我们什么时候把默认分支改成 main 的？",
+      "question_date": "2026-09-15",
+      "answer": "2026-09-08",
+      "answer_session_ids": [
+        "session_40_answer_6d18"
+      ],
+      "evidence_session_ids": [
+        "session_40_answer_6d18"
+      ],
+      "sessions": [
+        {
+          "session_id": "session_40_answer_6d18",
+          "date": "2026-09-08",
+          "answer": "默认分支从 master 改成 main。",
+          "messages": [
+            {
+              "role": "user",
+              "content": "把默认分支从 master 改成 main，今天就生效。",
+              "has_answer": true
+            }
+          ]
+        },
+        {
+          "session_id": "session_41_haystack_a2f0",
+          "date": "2026-09-12",
+          "messages": [
+            {
+              "role": "user",
+              "content": "分支保护规则再检查一遍。",
+              "has_answer": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "question_id": "smoke_knowledge_update_0001",
+      "question_type": "knowledge-update",
+      "question": "现在的默认 Python 版本是多少？",
+      "question_date": "2026-09-10",
+      "answer": "3.12",
+      "answer_session_ids": [
+        "session_51_answer_2e77"
+      ],
+      "evidence_session_ids": [
+        "session_50_answer_c93b",
+        "session_51_answer_2e77"
+      ],
+      "sessions": [
+        {
+          "session_id": "session_50_answer_c93b",
+          "date": "2026-09-01",
+          "answer": "默认 Python 版本是 3.10。",
+          "messages": [
+            {
+              "role": "user",
+              "content": "项目默认 Python 版本是 3.10。",
+              "has_answer": true
+            }
+          ]
+        },
+        {
+          "session_id": "session_51_answer_2e77",
+          "date": "2026-09-09",
+          "answer": "默认 Python 升级到 3.12。",
+          "messages": [
+            {
+              "role": "user",
+              "content": "默认 Python 升级到 3.12 了，3.10 下线。",
+              "has_answer": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "question_id": "smoke_multi_session_0001",
+      "question_type": "multi-session",
+      "question": "我们预订的团建民宿最多能住几个人？",
+      "question_date": "2026-09-11",
+      "answer": "8",
+      "answer_session_ids": [
+        "session_60_answer_f1a3",
+        "session_61_answer_8c5d"
+      ],
+      "evidence_session_ids": [
+        "session_60_answer_f1a3",
+        "session_61_answer_8c5d"
+      ],
+      "sessions": [
+        {
+          "session_id": "session_60_answer_f1a3",
+          "date": "2026-09-02",
+          "answer": "团建订了山里的民宿。",
+          "messages": [
+            {
+              "role": "user",
+              "content": "团建订了山里的民宿，定金已付。",
+              "has_answer": true
+            }
+          ]
+        },
+        {
+          "session_id": "session_61_answer_8c5d",
+          "date": "2026-09-04",
+          "answer": "整栋最多住 8 人。",
+          "messages": [
+            {
+              "role": "assistant",
+              "content": "民宿老板确认：整栋最多住 8 人，带院子。",
+              "has_answer": true
+            }
+          ]
+        },
+        {
+          "session_id": "session_62_haystack_47be",
+          "date": "2026-09-05",
+          "messages": [
+            {
+              "role": "assistant",
+              "content": "【例会备份 01】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 02】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 03】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 04】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 05】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 06】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 07】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 08】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 09】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 10】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 11】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 12】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 13】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 14】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 15】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 16】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 17】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 18】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 19】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 20】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 21】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 22】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 23】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 24】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 25】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 26】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 27】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 28】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 29】本周例会纪要：进度正常，无新增风险，行动项按期推进。【例会备份 30】本周例会纪要：进度正常，无新增风险，行动项按期推进。",
+              "has_answer": false
+            }
+          ]
+        },
+        {
+          "session_id": "session_63_haystack_d902",
+          "date": "2026-09-06",
+          "messages": [
+            {
+              "role": "user",
+              "content": "把团建的采购清单发我一份。",
+              "has_answer": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "question_id": "smoke_abstention_0001_abs",
+      "question_type": "multi-session",
+      "question": "我现在住在哪个城市？",
+      "question_date": "2026-09-09",
+      "answer": "I don't know the answer.",
+      "answer_session_ids": [],
+      "evidence_session_ids": [],
+      "sessions": [
+        {
+          "session_id": "session_70_haystack_1e5c",
+          "date": "2026-09-01",
+          "messages": [
+            {
+              "role": "user",
+              "content": "把仓库的镜像源换成国内的。",
+              "has_answer": false
+            }
+          ]
+        },
+        {
+          "session_id": "session_71_haystack_b8e0",
+          "date": "2026-09-03",
+          "messages": [
+            {
+              "role": "assistant",
+              "content": "镜像源替换完成，构建速度恢复正常。",
+              "has_answer": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "question_id": "smoke_abstention_0002_abs",
+      "question_type": "single-session-user",
+      "question": "我的护照号码是多少？",
+      "question_date": "2026-09-10",
+      "answer": "I don't know the answer.",
+      "answer_session_ids": [],
+      "evidence_session_ids": [],
+      "sessions": [
+        {
+          "session_id": "session_80_haystack_6f34",
+          "date": "2026-09-02",
+          "messages": [
+            {
+              "role": "user",
+              "content": "帮我把证件照片扫描件归档到网盘。",
+              "has_answer": false
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
