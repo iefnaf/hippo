@@ -21,13 +21,14 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field
 
 from eval.config import ConfigArtifact
 from eval.contracts.adapter import ErrorInfo, ResourceUsage
-from eval.contracts.common import ContractError, SchemaVersionedModel
+from eval.contracts.common import ContractError, ContractModel, SchemaVersionedModel
+from eval.contracts.internal import MetricResult
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -44,14 +45,22 @@ def inline_ref(value: Any) -> str:
 
 
 class SamplePlanCounts(SchemaVersionedModel):
-    """Expected call counts for one sample; a function of the config."""
+    """Expected call counts for one sample; a function of the config.
+
+    For operations-suite checks the counts describe the calls the check
+    makes when it actually runs (a check gated out by missing
+    capabilities is not_supported and makes no calls).
+    """
 
     sessions: int = Field(ge=1)
     ingest_calls: int = Field(ge=1)
     await_ready_calls: int = Field(ge=0)
+    update_calls: int = Field(default=0, ge=0)
+    delete_calls: int = Field(default=0, ge=0)
+    inspect_calls: int = Field(default=0, ge=0)
     open_calls: int = Field(ge=1)
     close_calls: int = Field(ge=1)
-    retrieve_calls: int = Field(ge=1)
+    retrieve_calls: int = Field(ge=0)
     reader_calls: int = 0
     judge_calls: int = 0
 
@@ -61,6 +70,7 @@ class RunManifest(SchemaVersionedModel):
 
     run_id: str = Field(min_length=1)
     command: str = "run"
+    suite: Literal["qa", "operations"] = "qa"
     created_at: str
     config_name: str
     config_fingerprint: str
@@ -104,6 +114,55 @@ class AttemptLogArtifact(SchemaVersionedModel):
     sample_handle: str
     namespace: str
     entries: list[AttemptEntry]
+
+
+class CheckAssertion(ContractModel):
+    """One deterministic assertion of an operations-suite check.
+
+    Assertions are computed by the program only; no LLM judge
+    participates in deciding whether an operation succeeded.
+    """
+
+    name: str = Field(min_length=1)
+    passed: bool
+    expected: str
+    observed: str
+
+
+class OperationCheckDetail(SchemaVersionedModel):
+    """Persisted detail of one operations-suite check item.
+
+    target_memory_ids lists the stable ids the check used as explicit
+    operation targets; every one of them originates from a
+    MutationReceipt, never from retrieval output.
+    """
+
+    run_id: str
+    check_id: str
+    operation_status: Literal["pending", "passed", "failed", "not_supported"]
+    namespaces: tuple[str, ...]
+    target_memory_ids: tuple[str, ...]
+    required_capabilities: tuple[str, ...]
+    missing_capabilities: tuple[str, ...]
+    reason: str | None
+    failed_stage: str | None
+    assertions: list[CheckAssertion]
+
+
+class OperationsSummaryArtifact(SchemaVersionedModel):
+    """Run-level operations summary: pass/fail/not-supported are counted
+    separately and never merged; pending items keep the run incomplete."""
+
+    run_id: str
+    planned_checks: int = Field(ge=1)
+    passed: int = Field(ge=0)
+    failed: int = Field(ge=0)
+    not_supported: int = Field(ge=0)
+    pending: int = Field(ge=0)
+    pass_rate: float | None = Field(default=None, ge=0, le=1)
+    support_coverage: float | None = Field(default=None, ge=0, le=1)
+    metrics: list[MetricResult]
+    checks: list[OperationCheckDetail]
 
 
 class RunStore:
@@ -173,6 +232,7 @@ class RunStore:
         attempts_log: AttemptLogArtifact,
         raw_evidence: Any | None = None,
         prepared_evidence: Any | None = None,
+        operations_check: Any | None = None,
     ) -> dict[str, str]:
         """Persist per-sample artifacts; returns checksummed refs."""
         refs: dict[str, str] = {}
@@ -191,7 +251,18 @@ class RunStore:
                 f"artifacts/{safe}/prepared_evidence.json",
                 prepared_evidence.model_dump_json().encode("utf-8"),
             )
+        if operations_check is not None:
+            refs["operations_check"] = self._write_bytes(
+                f"artifacts/{safe}/operations_check.json",
+                operations_check.model_dump_json().encode("utf-8"),
+            )
         return refs
+
+    def write_operations_summary(self, summary: Any) -> str:
+        """Persist the run-level operations summary; returns its ref."""
+        return self._write_bytes(
+            "operations_summary.json", summary.model_dump_json().encode("utf-8")
+        )
 
     def append_result(self, result_artifact: Any) -> None:
         line = result_artifact.model_dump_json()

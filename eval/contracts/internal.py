@@ -27,10 +27,15 @@ from eval.contracts.common import (
 
 Attribution = Literal["hit_correct", "hit_wrong", "miss_correct", "miss_wrong"]
 
-#: Stage names of the run pipeline (fixed in M1).
+#: Stage names of the run pipeline (fixed in M1). "update", "delete"
+#: and "inspect" are the operations-suite stages: explicit mutations and
+#: the only state-observation channel.
 STAGE_NAMES = (
     "ingest",
     "await_ready",
+    "update",
+    "delete",
+    "inspect",
     "retrieve",
     "prepare",
     "read",

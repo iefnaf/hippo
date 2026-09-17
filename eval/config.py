@@ -50,6 +50,16 @@ DEFAULT_SMOKE_SAMPLE_IDS = (
     "smoke_abstention_0002",
 )
 
+#: Check items of the M1 operations suite (docs/design/eval-harness.md,
+#: section 操作). An operations-suite config plans exactly these ids.
+OPERATIONS_CHECK_IDS = (
+    "auto_update",
+    "explicit_update",
+    "delete",
+    "isolation",
+    "persistence",
+)
+
 
 class MemoryPlan(ContractModel):
     """Declared memory implementation under test (fixed before the run)."""
@@ -102,8 +112,10 @@ class ExperimentConfig(ContractModel):
     """
 
     name: str = Field(min_length=1)
+    suite: Literal["qa", "operations"] = "qa"
     dataset_plan: str = Field(min_length=1)
     sample_plan_id: str = Field(min_length=1)
+    #: qa: dataset sample handles; operations: OPERATIONS_CHECK_IDS.
     sample_ids: tuple[str, ...] = Field(min_length=1)
     smoke_subset_ids: tuple[str, ...] = Field(default=DEFAULT_SMOKE_SAMPLE_IDS)
     memory: MemoryPlan
@@ -120,6 +132,24 @@ class ExperimentConfig(ContractModel):
             dupes = sorted({s for s in v if v.count(s) > 1})
             raise ValueError(f"duplicate sample ids: {dupes}")
         return v
+
+    @model_validator(mode="after")
+    def _suite_rules(self) -> Self:
+        if self.suite == "operations":
+            unknown = [
+                s for s in self.sample_ids if s not in OPERATIONS_CHECK_IDS
+            ]
+            if unknown:
+                raise ValueError(
+                    f"operations-suite sample_ids must come from "
+                    f"{list(OPERATIONS_CHECK_IDS)}; unknown: {unknown}"
+                )
+            if self.smoke_subset_ids:
+                raise ValueError(
+                    "operations-suite configs must leave smoke_subset_ids "
+                    "empty; the smoke subset is a qa-suite concept"
+                )
+        return self
 
     @model_validator(mode="after")
     def _smoke_rules(self) -> Self:
@@ -155,6 +185,7 @@ class ExperimentConfig(ContractModel):
         return {
             "config_schema_version": CONFIG_SCHEMA_VERSION,
             "name": self.name,
+            "suite": self.suite,
             "dataset_plan": self.dataset_plan,
             "sample_plan_id": self.sample_plan_id,
             "sample_ids": list(self.sample_ids),
