@@ -32,19 +32,25 @@ notes = "M1 offline scaffold config; fake components only, smoke subset fixed."
 [memory]
 name = "fake-memory"
 baseline_kind = "adapter"
+# Declared before the run and cross-checked against the adapter's
+# capabilities(); the fake profile below fixes exactly this set.
 capabilities = [
   "extractive_evidence",
   "generated_evidence",
   "state_inspection",
-  "auto_update",
-  "update",
-  "delete",
+  "async_mutation",
   "idempotent_mutation",
   "operation_status",
 ]
 
 [memory.config]
-store = "in-memory"
+# FakeMemorySpec knobs (fixed before the run):
+mutation_mode = "async"           # sync returns completed receipts directly
+evidence_kinds = ["extractive", "generated"]
+retrieval_mode = "match"          # match ranks by overlap; flood returns all
+idempotent = true
+state_inspection = true
+async_lag = 1                     # await_ready polls before completing
 
 [reader]
 model = "fake-reader"

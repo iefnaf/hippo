@@ -1,8 +1,11 @@
 """Hippo eval CLI: run / resume / compare / validate.
 
-M1 scope: validate is fully offline and structural. run/resume/compare
-print their planned behavior with the loaded config fingerprint and exit
-non-zero on invalid input; full orchestration lands in later milestones.
+validate is fully offline and structural. run executes the M1 offline
+loop (per-session ingest -> reopen -> retrieve -> evidence preparation)
+with the fake memory components declared by the config when --out is
+given; without --out it prints the plan only (offline summary, nothing
+executed). resume/compare remain config-level checks until their
+milestones.
 """
 
 from __future__ import annotations
@@ -47,8 +50,53 @@ def _load_config_or_exit(path: str) -> ExperimentConfig:
         raise SystemExit(2) from exc
 
 
+def _execute_offline_run(config: ExperimentConfig, args: argparse.Namespace) -> int:
+    from eval.contracts.common import now_utc
+    from eval.datasets.manual import DEFAULT_DATASET_PATH, ManualDataset
+    from eval.memories.fake import build_fake_adapter
+    from eval.runner import OfflineRunner
+    from eval.runs import RunStore, new_run_id
+
+    try:
+        dataset = ManualDataset.from_file(args.dataset or DEFAULT_DATASET_PATH)
+        adapter = build_fake_adapter(config.memory)
+    except ContractError as exc:
+        _print_contract_error(exc)
+        return 2
+    run_id = new_run_id(config.fingerprint(), clock=now_utc)
+    store = RunStore(Path(args.out), run_id)
+    runner = OfflineRunner(
+        config=config,
+        dataset=dataset,
+        adapter=adapter,
+        store=store,
+        run_id=run_id,
+    )
+    try:
+        outcome = runner.run()
+    except ContractError as exc:
+        _print_contract_error(exc)
+        return 2
+    payload = {
+        "command": "run",
+        "run_id": outcome.run_id,
+        "run_dir": str(outcome.run_dir),
+        "config": config.name,
+        "config_fingerprint": config.fingerprint(),
+        "metrics_registry_version": config.canonical_payload()[
+            "metrics_registry_version"
+        ],
+        "sample_count": len(outcome.results),
+        **outcome.summary(),
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0 if outcome.failed == 0 else 1
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     config = _load_config_or_exit(args.config)
+    if args.out:
+        return _execute_offline_run(config, args)
     plan = {
         "command": "run",
         "config": config.name,
@@ -57,8 +105,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             "metrics_registry_version"
         ],
         "sample_count": len(config.sample_ids),
-        "status": "not-implemented (M2 wires the real runner; M1 validates "
-        "configs, contracts and fixtures offline)",
+        "status": "not-executed (pass --out DIR to execute the offline M1 "
+        "loop: per-session ingest -> reopen -> retrieve -> prepare; fake "
+        "components only, no external model)",
     }
     print(json.dumps(plan, indent=2, ensure_ascii=False))
     return 0
@@ -123,8 +172,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_validate.set_defaults(func=cmd_validate)
 
-    p_run = sub.add_parser("run", help="run an experiment (M2)")
+    p_run = sub.add_parser("run", help="run an experiment (M1 offline loop)")
     p_run.add_argument("--config", required=True)
+    p_run.add_argument(
+        "--out",
+        default=None,
+        metavar="DIR",
+        help="execute the offline loop and write the run directory here",
+    )
+    p_run.add_argument(
+        "--dataset",
+        default=None,
+        metavar="JSON",
+        help="manual dataset fixture (default: the bundled smoke samples)",
+    )
     p_run.set_defaults(func=cmd_run)
 
     p_resume = sub.add_parser("resume", help="resume a run from checkpoints (M2)")
