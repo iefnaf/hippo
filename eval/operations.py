@@ -96,7 +96,7 @@ UPDATE_TARGET_SESSION = Session(
         Message(
             msg_id="m_ops_update_1",
             role="user",
-            content="部署约定：跑 uv run pytest 再发布。",
+            content="部署约定：版本再发布前跑 uv run pytest。",
         )
     ],
 )
@@ -109,8 +109,10 @@ UPDATE_UNRELATED_SESSION = Session(
 )
 UPDATE_REPLACEMENT = "部署约定：用 ruff，发布前跑 uv run pytest。"
 #: Distinctive markers: OLD occurs only in the pre-update text, NEW only
-#: in the replacement. Both appear early enough to survive the fake's
-#: 16-character summary prefixes, so derived summaries are checkable.
+#: in the replacement. Both sit INSIDE the first 16 characters of their
+#: texts so they survive the fake's summary prefixes — that is what
+#: makes the before/after summary assertions discriminative instead of
+#: vacuously true (tests/eval guard the marker positions).
 UPDATE_OLD_MARKER = "再发布"
 UPDATE_NEW_MARKER = "ruff"
 UPDATE_TOPIC_QUERY = "部署约定 发布流程是什么"
@@ -329,7 +331,7 @@ class OperationsRunner(RunnerBase):
             ),
             "explicit_update": dict(
                 sessions=2, ingest=2, update=1, delete=0,
-                inspect=2 if has_state else 0, open=4, retrieve=1,
+                inspect=2 if has_state else 0, open=4, retrieve=2,
             ),
             "delete": dict(
                 sessions=2, ingest=2, update=0, delete=1,
@@ -691,6 +693,39 @@ class OperationsRunner(RunnerBase):
         other_receipt = self._ingest_cycle(ctx, ns, UPDATE_UNRELATED_SESSION, 1)
 
         self._open(ctx, ns)
+        # Positive control BEFORE updating, mirroring the delete check:
+        # the old convention (and, when summaries are declared, a derived
+        # summary embedding it) must be observable now — otherwise the
+        # post-update "no stale summary" assertion would be vacuous.
+        pre_evidence = self._retrieve(ctx, ns, UPDATE_TOPIC_QUERY)
+        self._assert(
+            ctx,
+            "retrieve",
+            "old convention observable before update",
+            any(UPDATE_OLD_MARKER in e.text for e in pre_evidence),
+            f"some evidence contains {UPDATE_OLD_MARKER!r}",
+            "recalled"
+            if any(UPDATE_OLD_MARKER in e.text for e in pre_evidence)
+            else "not recalled",
+        )
+        if "generated_evidence" in capabilities:
+            self._assert(
+                ctx,
+                "retrieve",
+                "derived summary embeds the old convention before update",
+                any(
+                    e.kind == "generated" and UPDATE_OLD_MARKER in e.text
+                    for e in pre_evidence
+                ),
+                f"some generated evidence contains {UPDATE_OLD_MARKER!r}",
+                "covered"
+                if any(
+                    e.kind == "generated"
+                    and UPDATE_OLD_MARKER in e.text
+                    for e in pre_evidence
+                )
+                else "not covered",
+            )
         target_id = self._select_target(
             ctx, ns, target_receipt, UPDATE_OLD_MARKER, capabilities
         )

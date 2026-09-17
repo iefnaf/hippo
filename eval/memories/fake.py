@@ -32,7 +32,9 @@ offline:
   cleaned message span;
 - delete(): removes the entry and keeps an observable tombstone;
   inspect() reports validity='deleted' (content=null) so the runner
-  never has to guess deletion from a missing row;
+  never has to guess deletion from a missing row; aggregate summaries
+  are built over current entries only (superseded history remains
+  retrievable as extractive units, never inside fresh summaries);
 - state_returns_unknown: declares state_inspection but answers every
   inspect() with validity='unknown' — used to prove the suite records
   "declared but unknown" as a failure, never as a pass;
@@ -685,7 +687,10 @@ class FakeMemoryAdapter:
                     )
                 )
         if "generated" in self.spec.evidence_kinds:
-            top = [m for m, _ in selected[:3]]
+            # The aggregate summary reflects CURRENT knowledge: superseded
+            # history stays retrievable as extractive units only, so a
+            # retained old convention never leaks into a fresh summary.
+            top = [m for m, _ in selected if m.validity == "current"][:3]
             if top:
                 evidence.append(
                     Evidence(

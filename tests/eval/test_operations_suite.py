@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from eval.config import OPERATIONS_CHECK_IDS, load_config_dict
-from eval.contracts.adapter import MutationReceipt
+from eval.contracts.adapter import Evidence, MutationReceipt
 from eval.contracts.common import ContractError
 from eval.contracts.internal import ResultArtifact
 from eval.memories.fake import FakeMemoryAdapter, FakeMemorySpec
@@ -157,6 +157,40 @@ class AmnesiaAdapter(FakeMemoryAdapter):
         super().close(namespace)
 
 
+class StaleSummaryAdapter(FakeMemoryAdapter):
+    """Keeps serving a derived summary built from the pre-update text.
+
+    The stale prefix carries the old marker inside its first 16
+    characters, so the post-update "no stale summary" assertion must
+    catch it (a summary that could never contain the marker would make
+    that assertion vacuous)."""
+
+    def __init__(self, spec):
+        super().__init__(spec)
+        self._stale_prefix: str | None = None
+
+    def update(self, namespace, memory_id, replacement, operation_id):
+        stored = self._spaces[namespace].get(memory_id)
+        if stored is not None:
+            self._stale_prefix = stored.content[:16]
+        return super().update(namespace, memory_id, replacement, operation_id)
+
+    def retrieve(self, namespace, request):
+        evidence = list(super().retrieve(namespace, request))
+        if self._stale_prefix is not None:
+            evidence.append(
+                Evidence(
+                    kind="generated",
+                    text="摘要：" + self._stale_prefix,
+                    extractive_span=None,
+                    derivation_sources=[],
+                    source_times=[],
+                    retrieval_score=None,
+                )
+            )
+        return evidence
+
+
 class TestSuitePassesWithFullCapabilities:
     def test_example_config_all_checks_pass(self, tmp_path: Path):
         from eval.config import load_config_toml
@@ -255,6 +289,10 @@ class TestExplicitUpdateAssertions:
         names = {a.name: a for a in detail.assertions}
         assert names["updated target content equals the replacement"].passed
         assert names["updated target is current"].passed
+        # Positive controls BEFORE the update keep the stale-summary
+        # assertion discriminative.
+        assert names["old convention observable before update"].passed
+        assert names["derived summary embeds the old convention before update"].passed
         retained = [
             a for a in detail.assertions if a.name.startswith("retained old value")
         ]
@@ -285,6 +323,57 @@ class TestExplicitUpdateAssertions:
                 receipt_ids.update(output["memory_ids"])
         assert receipt_ids
         assert set(detail.target_memory_ids) <= receipt_ids
+
+    def test_markers_sit_inside_summary_prefixes(self):
+        """Guard the discriminative power of the summary assertions.
+
+        The fake builds derived summaries from 16-character prefixes, so
+        a marker outside that window can never appear in any summary and
+        the before/after assertions would pass vacuously (the regression
+        this test pins).
+        """
+        from eval.operations import (
+            UPDATE_NEW_MARKER,
+            UPDATE_OLD_MARKER,
+            UPDATE_REPLACEMENT,
+            UPDATE_TARGET_SESSION,
+            UPDATE_UNRELATED_SESSION,
+        )
+
+        old = UPDATE_TARGET_SESSION.messages[0].content
+        unrelated = UPDATE_UNRELATED_SESSION.messages[0].content
+        assert UPDATE_OLD_MARKER in old[:16]
+        assert UPDATE_NEW_MARKER in UPDATE_REPLACEMENT[:16]
+        # Markers stay distinctive: never cross-embedded, never in the
+        # unrelated filler.
+        assert UPDATE_OLD_MARKER not in UPDATE_REPLACEMENT
+        assert UPDATE_NEW_MARKER not in old
+        assert UPDATE_OLD_MARKER not in unrelated
+        assert UPDATE_NEW_MARKER not in unrelated
+
+    def test_stale_summary_fails_explicit_update(self, tmp_path: Path):
+        config = ops_config(sample_ids=["explicit_update"])
+        adapter = StaleSummaryAdapter(
+            FakeMemorySpec.from_memory_plan(config.memory)
+        )
+        runner, _ = make_runner(tmp_path, config, adapter=adapter)
+        outcome = runner.run()
+        detail = detail_of(outcome, "explicit_update")
+        assert detail.operation_status == "failed"
+        assert detail.failed_stage == "retrieve"
+        stale = next(
+            a for a in detail.assertions
+            if a.name == "no derived summary still embeds the old convention"
+        )
+        assert not stale.passed
+        assert "1 generated units still contain it" in stale.observed
+        # The pre-update positive control did observe the old marker in a
+        # summary, proving the failure is about staleness, not coverage.
+        covered = next(
+            a for a in detail.assertions
+            if a.name == "derived summary embeds the old convention before update"
+        )
+        assert covered.passed
 
     def test_noop_update_fails_on_content_mismatch(self, tmp_path: Path):
         config = ops_config(sample_ids=["explicit_update"])

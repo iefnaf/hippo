@@ -443,6 +443,42 @@ class TestAutoUpdateCapability:
         assert all(m.validity == "current" for m in space.values())
         adapter.close("ns")
 
+    def test_summary_covers_current_knowledge_only(self):
+        # Aggregate summaries are built over current entries; superseded
+        # history stays retrievable as extractive units and never leaks
+        # into a fresh summary.
+        adapter = FakeMemoryAdapter(
+            FakeMemorySpec(
+                auto_update=True, evidence_kinds=("extractive", "generated")
+            )
+        )
+        adapter.reset("ns")
+        adapter.open("ns")
+        adapter.ingest(
+            "ns",
+            Session(
+                session_id="s1", occurred_at="2026-09-01",
+                messages=[Message(msg_id="m1", role="user", content="包管理器约定：使用 npm。")],
+            ),
+            "op-1",
+        )
+        adapter.ingest(
+            "ns",
+            Session(
+                session_id="s2", occurred_at="2026-09-03",
+                messages=[
+                    Message(msg_id="m2", role="user", content="包管理器约定：迁移到 pnpm，以后都用 pnpm。")
+                ],
+            ),
+            "op-2",
+        )
+        evidence = adapter.retrieve("ns", make_request("包管理器约定是什么"))
+        summaries = [e.text for e in evidence if e.kind == "generated"]
+        assert summaries
+        assert all("使用 npm" not in text for text in summaries)
+        assert any("pnpm" in text for text in summaries)
+        adapter.close("ns")
+
     def test_current_ranks_above_superseded_in_retrieval(self):
         adapter = self._adapter(True)
         adapter.ingest(
