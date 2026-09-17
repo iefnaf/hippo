@@ -146,9 +146,14 @@ class Reporter:
     # -- loading ------------------------------------------------------------
 
     def _load_results(self) -> list[Any]:
-        results = []
+        # Last-wins per sample handle: a resumed sample appends a new
+        # Result line and the latest terminal record supersedes its
+        # checkpointed predecessor.
+        latest: dict[str, Any] = {}
         for line in self.store.read_result_lines():
-            results.append(ResultArtifact.load_json(json.dumps(line)).result)
+            result = ResultArtifact.load_json(json.dumps(line)).result
+            latest[result.sample_handle] = result
+        results = list(latest.values())
         planned_ids = list(self.manifest["sample_ids"])
         seen = [r.sample_handle for r in results]
         if sorted(seen) != sorted(planned_ids):
