@@ -149,6 +149,9 @@ class RunOutcome:
     failed: int = 0
     invalid_input: int = 0
     scored: int = 0
+    re_run: int = 0
+    reused: int = 0
+    re_run_handles: list[str] = field(default_factory=list)
     report_refs: dict[str, str] = field(default_factory=dict)
 
     def summary(self) -> dict[str, Any]:
@@ -162,8 +165,29 @@ class RunOutcome:
             "pending": sum(
                 1 for r in self.results if r.result.qa_status == "pending"
             ),
+            "re_run": self.re_run,
+            "reused": self.reused,
+            "re_run_handles": list(self.re_run_handles),
             "report": dict(self.report_refs),
         }
+
+
+@dataclass
+class _SampleResume:
+    """Checkpointed state of one sample being resumed.
+
+    saved_* carry artifacts of stages already completed by the prior
+    invocation; prior attempts/entries are merged into the resumed
+    record so retry+replay usage keeps counting into run totals. Every
+    call the resume makes is marked attempt_kind='replay'.
+    """
+
+    saved_raw: list[Evidence] | None = None
+    saved_prepared: PreparedEvidence | None = None
+    saved_reader: ReaderResult | None = None
+    prior_attempts: list[StageAttempt] = field(default_factory=list)
+    prior_entries: list[AttemptEntry] = field(default_factory=list)
+    prior_refs: dict[str, str] = field(default_factory=dict)
 
 
 def _operation_id(run_id: str, namespace: str, stage: str, seq: int, payload: Any) -> str:
@@ -782,9 +806,101 @@ class OfflineRunner(RunnerBase):
                 config=self.config, config_fingerprint=self.config.fingerprint()
             ),
         )
+        return self._execute(async_mutation, resume=None)
+
+    def resume(self) -> RunOutcome:
+        """Continue a checkpointed run; only unfinished work executes.
+
+        verify_resume_compatibility gates reuse (config fingerprint,
+        space identity, checkpoint schema versions); terminal samples
+        and their artifacts are reused untouched, failed samples resume
+        from their first unfinished stage using saved evidence, and all
+        recovery calls are reported as replay usage.
+        """
+        self._pre_run_checks()
+        async_mutation = "async_mutation" in set(self.adapter.capabilities())
+        from eval.runs import verify_resume_compatibility
+
+        prior = verify_resume_compatibility(
+            self.config,
+            self.store,
+            namespace_for_handle=lambda handle: self.dataset.namespace_for(
+                handle, self.config.sample_plan_id
+            ),
+        )
+        self.store.open_for_resume()
+        outcome = self._execute(async_mutation, resume=prior["results"])
+        self.store.append_resume_marker(
+            {
+                "resumed_at": self._clock(),
+                "run_id": self.run_id,
+                "re_run": outcome.re_run,
+                "reused": outcome.reused,
+                "re_run_handles": outcome.re_run_handles,
+            }
+        )
+        return outcome
+
+    def _terminal(self, result: Result) -> bool:
+        # scored and invalid_input are terminal: invalid scoring data is
+        # a data error to fix with a NEW run, not something to retry.
+        return result.qa_status in ("scored", "invalid_input")
+
+    def _load_ref_model(self, ref: str | None, model: Any) -> Any | None:
+        if ref is None:
+            return None
+        doc = json.loads(self.store.resolve_ref(ref).read_text(encoding="utf-8"))
+        return model.load_json(json.dumps(doc))
+
+    def _resume_plan(self, prior: Any) -> _SampleResume:
+        """Decide which saved stages a resumed sample may reuse."""
+        result = prior.result
+        plan = _SampleResume(
+            prior_attempts=list(result.attempts),
+            prior_refs=dict(result.artifact_refs),
+        )
+        log = self._load_ref_model(
+            result.artifact_refs.get("attempts"), AttemptLogArtifact
+        )
+        plan.prior_entries = list(log.entries) if log is not None else []
+        saved_raw = self._load_ref_model(
+            result.artifact_refs.get("raw_evidence"), RawEvidenceArtifact
+        )
+        saved_prepared = self._load_ref_model(
+            result.artifact_refs.get("prepared_evidence"),
+            PreparedEvidenceArtifact,
+        )
+        saved_reader = self._load_ref_model(
+            result.artifact_refs.get("reader_result"), ReaderResultArtifact
+        )
+        failed = result.failed_stage
+        if failed in ("read", "score", "judge") and saved_prepared is not None:
+            # Saved retrieval evidence is reused directly; the memory
+            # space is never rebuilt for reader/judge recovery.
+            plan.saved_prepared = saved_prepared.prepared
+            if saved_raw is not None:
+                plan.saved_raw = list(saved_raw.evidence)
+            if failed in ("score", "judge") and saved_reader is not None:
+                plan.saved_reader = saved_reader.result
+            return plan
+        if failed == "prepare" and saved_raw is not None:
+            plan.saved_raw = list(saved_raw.evidence)
+        # everything else (no line, pending, or failed before retrieve):
+        # full re-run of the sample from its own operation log
+        return plan
+
+    def _execute(
+        self, async_mutation: bool, resume: dict[str, Any] | None
+    ) -> RunOutcome:
         outcome = RunOutcome(run_id=self.run_id, run_dir=self.store.dir)
         for handle in self.config.sample_ids:
-            artifact = self._run_sample(handle, async_mutation)
+            prior = resume.get(handle) if resume is not None else None
+            if prior is not None and self._terminal(prior.result):
+                outcome.results.append(prior)
+                outcome.reused += 1
+                continue
+            plan = self._resume_plan(prior) if prior is not None else None
+            artifact = self._run_sample(handle, async_mutation, resume=plan)
             outcome.results.append(artifact)
             if artifact.result.qa_status == "failed":
                 outcome.failed += 1
@@ -792,6 +908,9 @@ class OfflineRunner(RunnerBase):
                 outcome.invalid_input += 1
             elif artifact.result.qa_status == "scored":
                 outcome.scored += 1
+            if resume is not None:
+                outcome.re_run += 1
+                outcome.re_run_handles.append(handle)
         from eval.report import Reporter, render_markdown
 
         reporter = Reporter(self.store.dir)
@@ -799,6 +918,7 @@ class OfflineRunner(RunnerBase):
         outcome.report_refs = self.store.write_report(
             json.dumps(report, ensure_ascii=False, indent=2),
             render_markdown(report),
+            overwrite=resume is not None,
         )
         return outcome
 
@@ -812,6 +932,7 @@ class OfflineRunner(RunnerBase):
         attempts: list[StageAttempt],
         entries: list[AttemptEntry],
         stage_states: dict[str, str],
+        base_kind: str = "logical",
     ) -> None:
         """open -> ingest (exactly the current session) -> completion
         confirmation -> close, per session.
@@ -824,7 +945,7 @@ class OfflineRunner(RunnerBase):
         attempt_kind='replay' so their usage reports as recovery.
         """
         replays = 0
-        kind = "logical"
+        kind = base_kind
         while True:
             try:
                 for i, session in enumerate(sessions):
@@ -884,6 +1005,7 @@ class OfflineRunner(RunnerBase):
         namespace: str,
         attempts: list[StageAttempt],
         entries: list[AttemptEntry],
+        attempt_kind: str = "logical",
     ) -> list[Evidence]:
         """Read-only retrieve with bounded transient retries."""
         request = self.dataset.build_retrieval_request(
@@ -899,6 +1021,7 @@ class OfflineRunner(RunnerBase):
             attempts=attempts,
             entries=entries,
             retryable=lambda error: error.transient,
+            attempt_kind=attempt_kind,
         )
         assert raw is not None
         return list(raw)
@@ -910,6 +1033,7 @@ class OfflineRunner(RunnerBase):
         history: HistoryIndex,
         attempts: list[StageAttempt],
         entries: list[AttemptEntry],
+        attempt_kind: str = "logical",
     ) -> PreparedEvidence:
         """Budget preparation is deterministic: no retries, no patching."""
         tokenizer = TestCharTokenizer()
@@ -930,6 +1054,7 @@ class OfflineRunner(RunnerBase):
                 tokenizer=tokenizer,
             ),
             error_transform=_prepare_error_transform,
+            attempt_kind=attempt_kind,
         )
         attempts.append(attempt)
         entries.append(entry)
@@ -938,7 +1063,12 @@ class OfflineRunner(RunnerBase):
         assert prepared is not None
         return prepared
 
-    def _run_sample(self, handle: str, async_mutation: bool) -> ResultArtifact:
+    def _run_sample(
+        self,
+        handle: str,
+        async_mutation: bool,
+        resume: _SampleResume | None = None,
+    ) -> ResultArtifact:
         namespace = self.dataset.namespace_for(handle, self.config.sample_plan_id)
         self._lifecycle_entries = []
         stage_states: dict[str, str] = {
@@ -949,71 +1079,134 @@ class OfflineRunner(RunnerBase):
             "score": "pending",
             "judge": "pending",
         }
-        attempts: list[StageAttempt] = []
-        entries: list[AttemptEntry] = []
+        base_kind = "replay" if resume is not None else "logical"
+        attempts: list[StageAttempt] = (
+            list(resume.prior_attempts) if resume is not None else []
+        )
+        entries: list[AttemptEntry] = (
+            list(resume.prior_entries) if resume is not None else []
+        )
         failed_stage: str | None = None
         failure: ErrorInfo | None = None
         invalid_input = False
-        raw_evidence: list[Evidence] | None = None
-        prepared: PreparedEvidence | None = None
-        reader_result: ReaderResult | None = None
+        raw_evidence: list[Evidence] | None = (
+            resume.saved_raw if resume is not None else None
+        )
+        prepared: PreparedEvidence | None = (
+            resume.saved_prepared if resume is not None else None
+        )
+        reader_result: ReaderResult | None = (
+            resume.saved_reader if resume is not None else None
+        )
+        new_raw = False
+        new_prepared = False
+        new_reader = False
+        if resume is not None:
+            if resume.saved_prepared is not None:
+                stage_states["retrieve"] = "completed"
+                stage_states["prepare"] = "completed"
+            elif resume.saved_raw is not None:
+                stage_states["retrieve"] = "completed"
         scoring: SampleScoring | None = None
         sessions = self.dataset.iter_sessions(handle)
+        # The memory space is rebuilt only when no saved evidence can
+        # carry the sample forward (nothing saved, or the failure was
+        # before retrieve completed).
+        memory_phase = (
+            resume is None
+            or (resume.saved_raw is None and resume.saved_prepared is None)
+        )
 
-        self._record_lifecycle("reset", namespace, lambda: self.adapter.reset(namespace))
-
-        try:
-            self._ingest_phase(
-                handle, namespace, sessions, attempts, entries, stage_states
-            )
-
-            # Query phase: reopen the persisted space and retrieve.
+        if memory_phase:
             self._record_lifecycle(
-                "open", namespace, lambda: self.adapter.open(namespace)
+                "reset", namespace, lambda: self.adapter.reset(namespace)
             )
-            raw = self._retrieve_stage(handle, namespace, attempts, entries)
-            raw_evidence = list(raw)
-            stage_states["retrieve"] = "completed"
+            try:
+                self._ingest_phase(
+                    handle,
+                    namespace,
+                    sessions,
+                    attempts,
+                    entries,
+                    stage_states,
+                    base_kind=base_kind,
+                )
 
-            history = build_history_index(sessions)
-            prepared = self._prepare_stage(
-                namespace, raw_evidence, history, attempts, entries
-            )
-            stage_states["prepare"] = "completed"
-        except _StageFailure as exc:
-            failed_stage = exc.stage
-            failure = exc.error
-            stage_states[exc.stage] = "failed"
+                # Query phase: reopen the persisted space and retrieve.
+                self._record_lifecycle(
+                    "open", namespace, lambda: self.adapter.open(namespace)
+                )
+                raw = self._retrieve_stage(
+                    handle, namespace, attempts, entries, attempt_kind=base_kind
+                )
+                raw_evidence = list(raw)
+                new_raw = True
+                stage_states["retrieve"] = "completed"
+
+                history = build_history_index(sessions)
+                prepared = self._prepare_stage(
+                    namespace, raw_evidence, history, attempts, entries,
+                    attempt_kind=base_kind,
+                )
+                new_prepared = True
+                stage_states["prepare"] = "completed"
+            except _StageFailure as exc:
+                failed_stage = exc.stage
+                failure = exc.error
+                stage_states[exc.stage] = "failed"
+        elif resume is not None and resume.saved_prepared is None:
+            # Failed at prepare with the raw return already saved: re-run
+            # the deterministic preparation only; no adapter calls.
+            try:
+                history = build_history_index(sessions)
+                assert raw_evidence is not None
+                prepared = self._prepare_stage(
+                    namespace, raw_evidence, history, attempts, entries,
+                    attempt_kind=base_kind,
+                )
+                new_prepared = True
+                stage_states["prepare"] = "completed"
+            except _StageFailure as exc:
+                failed_stage = exc.stage
+                failure = exc.error
+                stage_states[exc.stage] = "failed"
 
         try:
             # Answer phase: the reader consumes the exact retained evidence.
             question = self.dataset.get_question(handle)
             if failed_stage is None and prepared is not None:
-                try:
-                    reader_result = self._record_call_with_retries(
-                        stage="read",
-                        method="reader.answer",
-                        namespace=namespace,
-                        operation_id=None,
-                        input_payload={
-                            "question": question.model_dump(mode="json"),
-                            "prepared_token_count": prepared.token_count,
-                            "prepared_units": len(prepared.items),
-                            "tokenizer_id": prepared.tokenizer_id,
-                        },
-                        fn=lambda: self.reader.answer(question, prepared),
-                        attempts=attempts,
-                        entries=entries,
-                        error_transform=_reader_error_transform,
-                        usage_from=lambda r: r.usage,
-                        retryable=lambda error: error.transient,
-                    )
+                if reader_result is not None:
+                    # Resumed with an accepted reader answer: only the
+                    # scoring/judge stages remain.
                     stage_states["read"] = "completed"
-                except _StageFailure as exc:
-                    failed_stage = exc.stage
-                    failure = exc.error
-                    stage_states["read"] = "failed"
-                    reader_result = None
+                else:
+                    try:
+                        reader_result = self._record_call_with_retries(
+                            stage="read",
+                            method="reader.answer",
+                            namespace=namespace,
+                            operation_id=None,
+                            input_payload={
+                                "question": question.model_dump(mode="json"),
+                                "prepared_token_count": prepared.token_count,
+                                "prepared_units": len(prepared.items),
+                                "tokenizer_id": prepared.tokenizer_id,
+                            },
+                            fn=lambda: self.reader.answer(question, prepared),
+                            attempts=attempts,
+                            entries=entries,
+                            error_transform=_reader_error_transform,
+                            usage_from=lambda r: r.usage,
+                            retryable=lambda error: error.transient,
+                            attempt_kind=base_kind,
+                        )
+                        new_reader = True
+                        stage_states["read"] = "completed"
+                    except _StageFailure as exc:
+                        failed_stage = exc.stage
+                        failure = exc.error
+                        stage_states["read"] = "failed"
+                        reader_result = None
 
             # Scoring: recall from the same prepared evidence + judge
             # verdict. Runs even after ingest/retrieve/prepare/read
@@ -1113,9 +1306,10 @@ class OfflineRunner(RunnerBase):
                     stage_states["judge"] = "completed"
         finally:
             # Best-effort close; lifecycle failures land in the log only.
-            self._record_lifecycle(
-                "close", namespace, lambda: self.adapter.close(namespace)
-            )
+            if memory_phase:
+                self._record_lifecycle(
+                    "close", namespace, lambda: self.adapter.close(namespace)
+                )
             entries = self._lifecycle_entries + entries
 
         log_artifact = AttemptLogArtifact(
@@ -1130,7 +1324,7 @@ class OfflineRunner(RunnerBase):
                 sample_handle=handle,
                 evidence=raw_evidence,
             )
-            if raw_evidence is not None
+            if raw_evidence is not None and new_raw
             else None
         )
         prepared_artifact = (
@@ -1139,7 +1333,7 @@ class OfflineRunner(RunnerBase):
                 sample_handle=handle,
                 prepared=prepared,
             )
-            if prepared is not None
+            if prepared is not None and new_prepared
             else None
         )
         reader_artifact = (
@@ -1148,7 +1342,7 @@ class OfflineRunner(RunnerBase):
                 sample_handle=handle,
                 result=reader_result,
             )
-            if reader_result is not None
+            if reader_result is not None and new_reader
             else None
         )
         successful_judge = (
@@ -1180,6 +1374,13 @@ class OfflineRunner(RunnerBase):
                 scoring.trace if scoring is not None else None
             ),
         )
+        if resume is not None:
+            # Reused checkpoint artifacts keep their original refs;
+            # this round's writes (always under a .r<N> directory in
+            # resume mode) override whatever it re-produced.
+            merged = dict(resume.prior_refs)
+            merged.update(refs)
+            refs = merged
 
         metrics = scoring.metrics if scoring is not None else []
         if failed_stage is None:

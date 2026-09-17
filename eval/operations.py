@@ -309,14 +309,79 @@ class OperationsRunner(RunnerBase):
                 config=self.config, config_fingerprint=self.config.fingerprint()
             ),
         )
+        return self._execute(resume=None)
+
+    def resume(self) -> OperationsOutcome:
+        """Continue a checkpointed operations run.
+
+        Terminal checks (passed / not_supported) and their artifacts are
+        reused untouched; failed or missing checks are re-run (their
+        assertions are deterministic functions of the adapter, so a
+        re-run either reproduces the failure or recovers from an
+        environment-level fault).
+        """
+        self._check_capabilities()
+        from eval.runs import verify_resume_compatibility
+
+        prior = verify_resume_compatibility(
+            self.config,
+            self.store,
+            namespace_for_handle=lambda check_id: namespace_for(
+                self.config.sample_plan_id, check_id
+            ),
+        )
+        self.store.open_for_resume()
+        return self._execute(resume=prior["results"])
+
+    def _load_check_detail(self, ref: str | None) -> OperationCheckDetail:
+        import json as _json
+
+        assert ref is not None
+        doc = _json.loads(
+            self.store.resolve_ref(ref).read_text(encoding="utf-8")
+        )
+        return OperationCheckDetail.load_json(_json.dumps(doc))
+
+    def _load_prior_entries(self, ref: str | None) -> list[AttemptEntry]:
+        import json as _json
+
+        if ref is None:
+            return []
+        doc = _json.loads(
+            self.store.resolve_ref(ref).read_text(encoding="utf-8")
+        )
+        log = AttemptLogArtifact.load_json(_json.dumps(doc))
+        return list(log.entries)
+
+    def _execute(
+        self, resume: dict[str, Any] | None
+    ) -> OperationsOutcome:
+        capabilities = set(self.adapter.capabilities())
         outcome = OperationsOutcome(run_id=self.run_id, run_dir=self.store.dir)
         details: list[OperationCheckDetail] = []
         for check_id in self.config.sample_ids:
-            artifact, detail = self._run_check(check_id, capabilities)
+            prior = resume.get(check_id) if resume is not None else None
+            if (
+                prior is not None
+                and prior.result.operation_status
+                in ("passed", "not_supported")
+            ):
+                outcome.results.append(prior)
+                details.append(
+                    self._load_check_detail(
+                        prior.result.artifact_refs.get("operations_check")
+                    )
+                )
+                continue
+            artifact, detail = self._run_check(
+                check_id, capabilities, prior=prior
+            )
             outcome.results.append(artifact)
             details.append(detail)
         outcome.summary = self._build_summary(details)
-        self.store.write_operations_summary(outcome.summary)
+        self.store.write_operations_summary(
+            outcome.summary, overwrite=resume is not None
+        )
         return outcome
 
     # -- planning -----------------------------------------------------------
@@ -417,7 +482,10 @@ class OperationsRunner(RunnerBase):
     # -- per-check dispatch ---------------------------------------------------
 
     def _run_check(
-        self, check_id: str, capabilities: set[str]
+        self,
+        check_id: str,
+        capabilities: set[str],
+        prior: Any = None,
     ) -> tuple[ResultArtifact, OperationCheckDetail]:
         namespace = namespace_for(self.config.sample_plan_id, check_id)
         self._lifecycle_entries = []
@@ -432,6 +500,17 @@ class OperationsRunner(RunnerBase):
             namespace=namespace,
             namespaces=[namespace],
             stage_states={stage: "pending" for stage in CHECK_STAGES[check_id]},
+            attempts=(
+                list(prior.result.attempts) if prior is not None else []
+            ),
+            entries=(
+                self._load_prior_entries(
+                    prior.result.artifact_refs.get("attempts")
+                )
+                if prior is not None
+                else []
+            ),
+            attempt_kind="replay" if prior is not None else "logical",
         )
         if missing:
             # Undeclared optional capabilities are decided BEFORE the run:
@@ -489,6 +568,7 @@ class OperationsRunner(RunnerBase):
                         assertions=ctx.assertions,
                         attempt_kind="replay",
                     )
+                    continue
                 except (_StageFailure, _CheckFailure) as exc:
                     status = "failed"
                     failed_stage = exc.stage
@@ -523,6 +603,10 @@ class OperationsRunner(RunnerBase):
         refs = self.store.write_sample_artifacts(
             check_id, attempts_log=log_artifact, operations_check=detail
         )
+        if prior is not None:
+            merged = dict(prior.result.artifact_refs)
+            merged.update(refs)
+            refs = merged
         result = Result(
             run_id=self.run_id,
             sample_handle=check_id,
