@@ -52,19 +52,47 @@ def _load_config_or_exit(path: str) -> ExperimentConfig:
 
 def _execute_offline_run(config: ExperimentConfig, args: argparse.Namespace) -> int:
     from eval.contracts.common import now_utc
-    from eval.datasets.manual import DEFAULT_DATASET_PATH, ManualDataset
     from eval.memories.fake import build_fake_adapter
-    from eval.runner import OfflineRunner
     from eval.runs import RunStore, new_run_id
 
     try:
-        dataset = ManualDataset.from_file(args.dataset or DEFAULT_DATASET_PATH)
         adapter = build_fake_adapter(config.memory)
     except ContractError as exc:
         _print_contract_error(exc)
         return 2
     run_id = new_run_id(config.fingerprint(), clock=now_utc)
     store = RunStore(Path(args.out), run_id)
+    if config.suite == "operations":
+        from eval.operations import OperationsRunner
+
+        runner = OperationsRunner(
+            config=config, adapter=adapter, store=store, run_id=run_id
+        )
+        try:
+            outcome = runner.run()
+        except ContractError as exc:
+            _print_contract_error(exc)
+            return 2
+        payload = {
+            "command": "run",
+            "config": config.name,
+            "config_fingerprint": config.fingerprint(),
+            "metrics_registry_version": config.canonical_payload()[
+                "metrics_registry_version"
+            ],
+            **outcome.payload(),
+        }
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if outcome.failed == 0 else 1
+
+    from eval.datasets.manual import DEFAULT_DATASET_PATH, ManualDataset
+    from eval.runner import OfflineRunner
+
+    try:
+        dataset = ManualDataset.from_file(args.dataset or DEFAULT_DATASET_PATH)
+    except ContractError as exc:
+        _print_contract_error(exc)
+        return 2
     runner = OfflineRunner(
         config=config,
         dataset=dataset,

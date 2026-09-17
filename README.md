@@ -8,5 +8,5 @@ v1、配置指纹、validate 命令，以及离线单题闭环（逐会话写入
 - 设计文档：`docs/design/eval-harness.md`、`docs/design/eval-harness-data-contracts.md`
 - 运行测试：`uv run pytest`
 - 结构校验：`uv run hippo-eval validate --config eval/configs/examples/offline_fake.toml`
-- 离线闭环：`uv run hippo-eval run --config eval/configs/examples/offline_fake.toml --out runs`
+- 操作能力套件：`uv run hippo-eval run --config eval/configs/examples/offline_fake_ops.toml --out runs`（自动更新、显式更新、删除、隔离与重启后持久化；通过/失败/不支持分态记录，不经 LLM judge）
   （产出 run ID、不可变配置快照与逐题 JSONL；不含 `--out` 时仅打印计划）

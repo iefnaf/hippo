@@ -1,0 +1,74 @@
+# M1 offline fake operations-suite config.
+# Runs the deterministic operations checks (auto update, explicit
+# update, delete, isolation, persistence) against the fake memory
+# adapter; no external model is contacted and no LLM judge decides
+# operation outcomes. The config's suite field selects the operations
+# runner; sample_ids are the planned check items.
+
+name = "offline-fake-operations"
+suite = "operations"
+dataset_plan = "manual-operations@1"
+sample_plan_id = "operations-suite-v1"
+sample_ids = [
+  "auto_update",
+  "explicit_update",
+  "delete",
+  "isolation",
+  "persistence",
+]
+smoke_subset_ids = []
+evidence_token_budget = 4096
+notes = "M1 operations suite config; fake adapter declares the full operation capability set."
+
+[memory]
+name = "fake-memory"
+baseline_kind = "adapter"
+# Declared before the run and cross-checked against the adapter's
+# capabilities(); the fake profile below fixes exactly this set.
+capabilities = [
+  "extractive_evidence",
+  "generated_evidence",
+  "state_inspection",
+  "auto_update",
+  "update",
+  "delete",
+  "async_mutation",
+  "idempotent_mutation",
+  "operation_status",
+]
+
+[memory.config]
+# FakeMemorySpec knobs (fixed before the run):
+mutation_mode = "async"           # accepted receipts; completion via await_ready
+evidence_kinds = ["extractive", "generated"]
+retrieval_mode = "match"          # match ranks by overlap; flood returns all
+idempotent = true
+state_inspection = true
+auto_update = true                # consecutive ingests supersede old conventions
+update = true                     # explicit update() by stable receipt id
+delete = true                     # explicit delete() by stable receipt id
+update_retains_old = true         # keep old text as a superseded entry
+async_lag = 1                     # await_ready polls before completing
+
+[reader]
+model = "fake-reader"
+model_family = "fake-reader-family"
+base_url = "offline://fake"
+temperature = 0.0
+max_output_tokens = 1024
+tokenizer_id = "test:char-v1"
+counting_mode = "test"
+
+[judge]
+model = "fake-judge"
+model_family = "fake-judge-family"
+base_url = "offline://fake"
+temperature = 0.0
+protocol_id = "longmemeval-yes-no@1"
+protocol_source_commit = "0000000000000000000000000000000000000000"
+
+[run_params]
+max_retries = 3
+backoff_base_s = 1.0
+await_ready_timeout_s = 300.0
+question_concurrency = 1
