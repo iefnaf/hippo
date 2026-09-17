@@ -331,7 +331,43 @@ class OperationsRunner(RunnerBase):
             ),
         )
         self.store.open_for_resume()
-        return self._execute(resume=prior["results"])
+        outcome = self._execute(resume=prior["results"])
+        # Audit trail consistency with the qa runner (issue #5 leftover):
+        # resumed operations runs also record what was reused vs re-run.
+        def _was_terminal_before(artifact: Any) -> bool:
+            handle = artifact.result.sample_handle
+            before = prior["results"].get(handle)
+            return (
+                before is not None
+                and before.result.operation_status
+                in ("passed", "not_supported")
+            )
+
+        reused = sum(
+            1
+            for r in outcome.results
+            if r.result.operation_status in ("passed", "not_supported")
+            and _was_terminal_before(r)
+        )
+        self.store.append_resume_marker(
+            {
+                "resumed_at": self._clock(),
+                "run_id": self.run_id,
+                "suite": "operations",
+                "re_run": len(outcome.results) - reused,
+                "reused": reused,
+                "re_run_handles": [
+                    r.result.sample_handle
+                    for r in outcome.results
+                    if not (
+                        r.result.operation_status
+                        in ("passed", "not_supported")
+                        and _was_terminal_before(r)
+                    )
+                ],
+            }
+        )
+        return outcome
 
     def _load_check_detail(self, ref: str | None) -> OperationCheckDetail:
         import json as _json

@@ -752,6 +752,19 @@ class TestResume:
         assert summary["planned_checks"] == 5
         assert summary["passed"] == 5
 
+        # Issue #5 leftover: operations resume writes the same audit
+        # trail as the qa runner (resume.jsonl), recording what was
+        # reused vs re-run.
+        marker_path = run_dir / "resume.jsonl"
+        assert marker_path.exists()
+        marker = json.loads(marker_path.read_text(encoding="utf-8").splitlines()[-1])
+        assert marker["suite"] == "operations"
+        assert marker["run_id"] == "run-ops-resume"
+        assert marker["reused"] == 2
+        assert marker["re_run"] == 3
+        assert len(marker["re_run_handles"]) == 3
+        assert "resumed_at" in marker
+
 
 class TestResumeCli:
     """AC4 via the CLI surface."""
