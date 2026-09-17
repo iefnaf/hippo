@@ -9,6 +9,15 @@ offline:
 - stores cleaned messages per namespace; data survives close() and is
   observable after open() again (persistence), while process-internal
   state is dropped;
+- fault injection for the failure-recovery rules (issue #5):
+  response_loss_calls makes the first N accepted mutation submissions
+  raise response_lost AFTER the mutation took effect (uncertain
+  outcome); never_ready keeps async operations pending forever
+  (exercises the runner-side await_ready wall-clock timeout); reset()
+  quarantines in-flight operations of the discarded space so an
+  isolated old task can never apply to the replayed one; same-id
+  re-submits while an operation is pending return the in-flight receipt
+  in idempotent mode (exactly one logical mutation);
 - sync mode returns completed receipts from ingest/update/delete; async
   mode returns accepted and completes after async_lag await_ready
   polls, which never re-submit;
@@ -112,6 +121,12 @@ class FakeMemorySpec(ContractModel):
     delete: bool = False
     update_retains_old: bool = False
     state_returns_unknown: bool = False
+    #: Fault injection: lose the submit response of the first N mutation
+    #: calls AFTER they took effect (uncertain outcome, effect=possible).
+    response_loss_calls: int = Field(default=0, ge=0)
+    #: Fault injection: async operations never reach a terminal state
+    #: (exercises the runner-side await_ready wall-clock timeout).
+    never_ready: bool = False
 
     @model_validator(mode="after")
     def _kinds_nonempty(self) -> Self:
@@ -132,6 +147,11 @@ class FakeMemorySpec(ContractModel):
             raise ValueError(
                 "state_returns_unknown=true requires state_inspection=true; "
                 "an undeclared capability cannot return anything"
+            )
+        if self.never_ready and self.mutation_mode != "async":
+            raise ValueError(
+                "never_ready=true requires mutation_mode='async'; sync "
+                "receipts complete immediately and can never hang"
             )
         return self
 
@@ -267,6 +287,10 @@ class FakeMemoryAdapter:
         self._open: set[str] = set()
         self._pending: dict[str, _PendingOp] = {}
         self._idem_registry: dict[str, tuple[str, MutationReceipt]] = {}
+        # namespace -> operation ids isolated (quarantined) by reset().
+        self._quarantined: dict[str, list[str]] = {}
+        # Fault-injection budget of submit responses to lose.
+        self._response_loss_budget = int(spec.response_loss_calls)
         self.journal: list[dict[str, Any]] = []
         self.received_requests: list[RetrievalRequest] = []
 
@@ -344,6 +368,40 @@ class FakeMemoryAdapter:
             )
         return receipt
 
+    def _in_flight_replay(self, operation_id: str) -> MutationReceipt | None:
+        """Same-id re-submit while the operation is still pending.
+
+        Only meaningful in idempotent mode: a second submit with the same
+        operation id must never schedule a second logical mutation —
+        it returns the in-flight receipt so the runner keeps waiting on
+        the ORIGINAL task ("await the same id, never re-submit").
+        """
+        if not self.spec.idempotent:
+            return None
+        pending = self._pending.get(operation_id)
+        if pending is None:
+            return None
+        return pending.receipt
+
+    def _lose_response(self, operation_id: str) -> None:
+        """Fault injection: drop the submit response AFTER the mutation.
+
+        The server side has applied the mutation (and registered the
+        receipt/pending op); only the response is lost, so the runner
+        sees an UNCERTAIN outcome (effect=possible, transient blip).
+        """
+        if self._response_loss_budget <= 0:
+            return
+        self._response_loss_budget -= 1
+        raise MemoryAdapterError(
+            "response_lost",
+            f"simulated loss of the submit response for operation "
+            f"{operation_id!r}; the mutation was applied before the loss, "
+            "so the outcome is uncertain",
+            transient=True,
+            effect="possible",
+        )
+
     # -- protocol ----------------------------------------------------------
 
     def capabilities(self) -> set[str]:
@@ -357,6 +415,10 @@ class FakeMemoryAdapter:
         for op_id in [
             oid for oid, p in self._pending.items() if p.namespace == namespace
         ]:
+            # Isolation: the uncertain old task is parked in quarantine;
+            # it may still "complete" on the server side, but it can never
+            # apply to the replayed (fresh) space.
+            self._quarantined.setdefault(namespace, []).append(op_id)
             del self._pending[op_id]
 
     def open(self, namespace: str) -> None:
@@ -380,6 +442,11 @@ class FakeMemoryAdapter:
             # Same id + same input: exactly one logical mutation; the
             # terminal receipt is returned without storing again.
             return replayed
+        in_flight = self._in_flight_replay(operation_id)
+        if in_flight is not None:
+            # Same id while still pending: the original task is awaited,
+            # never a second logical mutation.
+            return in_flight
 
         space = self._space(namespace)
         memory_ids: list[str] = []
@@ -438,9 +505,11 @@ class FakeMemoryAdapter:
             llm_call_count=0,
         )
         report_usage(usage)
-        return self._finish_mutation(
+        receipt = self._finish_mutation(
             operation_id, namespace, memory_ids, sources, usage, digest
         )
+        self._lose_response(operation_id)
+        return receipt
 
     def update(
         self, namespace: str, memory_id: str, replacement: str, operation_id: str
@@ -463,6 +532,9 @@ class FakeMemoryAdapter:
         replayed = self._idem_check(operation_id, digest)
         if replayed is not None:
             return replayed
+        in_flight = self._in_flight_replay(operation_id)
+        if in_flight is not None:
+            return in_flight
 
         space = self._space(namespace)
         stored = space.get(memory_id)
@@ -504,7 +576,7 @@ class FakeMemoryAdapter:
             input_tokens=len(replacement), output_tokens=0, llm_call_count=0
         )
         report_usage(usage)
-        return self._finish_mutation(
+        receipt = self._finish_mutation(
             operation_id,
             namespace,
             [memory_id, *retained_ids],
@@ -512,6 +584,8 @@ class FakeMemoryAdapter:
             usage,
             digest,
         )
+        self._lose_response(operation_id)
+        return receipt
 
     def delete(
         self, namespace: str, memory_id: str, operation_id: str
@@ -533,6 +607,9 @@ class FakeMemoryAdapter:
         replayed = self._idem_check(operation_id, digest)
         if replayed is not None:
             return replayed
+        in_flight = self._in_flight_replay(operation_id)
+        if in_flight is not None:
+            return in_flight
 
         space = self._space(namespace)
         stored = space.get(memory_id)
@@ -559,7 +636,7 @@ class FakeMemoryAdapter:
 
         usage = ResourceUsage(input_tokens=0, output_tokens=0, llm_call_count=0)
         report_usage(usage)
-        return self._finish_mutation(
+        receipt = self._finish_mutation(
             operation_id,
             namespace,
             [memory_id],
@@ -569,6 +646,8 @@ class FakeMemoryAdapter:
             usage,
             digest,
         )
+        self._lose_response(operation_id)
+        return receipt
 
     def await_ready(
         self, namespace: str, operation_id: str, timeout: float
@@ -589,6 +668,10 @@ class FakeMemoryAdapter:
                 "await_ready must not submit new mutations",
                 effect="none",
             )
+        if self.spec.never_ready:
+            # Fault injection: the backend accepts but never finishes;
+            # only the runner-side wall clock can end this wait.
+            return pending.receipt
         pending.remaining -= 1
         if pending.remaining > 0:
             return pending.receipt
@@ -792,6 +875,19 @@ class FakeMemoryAdapter:
 
     def pending_operation_ids(self) -> list[str]:
         return sorted(self._pending)
+
+    def quarantined_operation_ids(self, namespace: str | None = None) -> list[str]:
+        """Operation ids isolated by reset() (uncertain old tasks).
+
+        A quarantined operation may still complete server-side, but its
+        effects live only in the discarded space: they can never pollute
+        the replayed namespace.
+        """
+        if namespace is None:
+            return sorted(
+                op for ids in self._quarantined.values() for op in ids
+            )
+        return sorted(self._quarantined.get(namespace, []))
 
 
 def _dedup(values: list[str]) -> list[str]:
