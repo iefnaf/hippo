@@ -4,8 +4,11 @@ validate is fully offline and structural. run executes the M1 offline
 loop (per-session ingest -> reopen -> retrieve -> evidence preparation)
 with the fake memory components declared by the config when --out is
 given; without --out it prints the plan only (offline summary, nothing
-executed). resume/compare remain config-level checks until their
-milestones.
+executed). resume continues an interrupted or partially failed run from
+its checkpoint directory: it refuses to reuse checkpoints whose config
+fingerprint, space identity or artifact schema version does not match
+and tells the user to start a new run. compare remains a config-level
+check until its milestone.
 """
 
 from __future__ import annotations
@@ -173,17 +176,102 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_resume(args: argparse.Namespace) -> int:
-    config = _load_config_or_exit(args.config)
-    plan = {
+def _execute_resume(config: ExperimentConfig, args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from eval.contracts.common import now_utc
+    from eval.memories.fake import build_fake_adapter
+    from eval.runs import RunStore
+
+    try:
+        adapter = build_fake_adapter(config.memory)
+    except ContractError as exc:
+        _print_contract_error(exc)
+        return 2
+    run_dir = Path(args.run)
+    store = RunStore(run_dir.parent, run_dir.name)
+    if config.suite == "operations":
+        from eval.operations import OperationsRunner
+
+        runner = OperationsRunner(
+            config=config, adapter=adapter, store=store, run_id=run_dir.name
+        )
+        try:
+            outcome = runner.resume()
+        except ContractError as exc:
+            _print_contract_error(exc)
+            return 2
+        payload = {
+            "command": "resume",
+            "config": config.name,
+            "config_fingerprint": config.fingerprint(),
+            "metrics_registry_version": config.canonical_payload()[
+                "metrics_registry_version"
+            ],
+            **outcome.payload(),
+        }
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if outcome.failed == 0 else 1
+
+    from eval.datasets.manual import DEFAULT_DATASET_PATH, ManualDataset
+    from eval.judges.fake import build_fake_judge
+    from eval.readers.fake import build_fake_reader
+    from eval.runner import OfflineRunner
+
+    try:
+        dataset = ManualDataset.from_file(args.dataset or DEFAULT_DATASET_PATH)
+    except ContractError as exc:
+        _print_contract_error(exc)
+        return 2
+    runner = OfflineRunner(
+        config=config,
+        dataset=dataset,
+        adapter=adapter,
+        reader=build_fake_reader(config.reader),
+        judge=build_fake_judge(config.judge),
+        store=store,
+        run_id=run_dir.name,
+    )
+    try:
+        outcome = runner.resume()
+    except ContractError as exc:
+        _print_contract_error(exc)
+        return 2
+    from eval.report import Reporter
+
+    report = Reporter(outcome.run_dir).build()
+    headline = {
+        m["metric_id"]: m["value"] if m["status"] == "computed" else None
+        for m in report["metrics"]
+        if m["metric_id"]
+        in (
+            "planned_question_score",
+            "scored_accuracy",
+            "verifiable_session_recall_macro",
+            "verifiable_session_recall_micro",
+            "recall_at_1",
+        )
+    }
+    payload = {
         "command": "resume",
+        "run_id": outcome.run_id,
+        "run_dir": str(outcome.run_dir),
         "config": config.name,
         "config_fingerprint": config.fingerprint(),
-        "status": "not-implemented (checkpoint resume requires a run "
-        "directory; M1 fixes the artifact schema versions it will check)",
+        "metrics_registry_version": config.canonical_payload()[
+            "metrics_registry_version"
+        ],
+        "sample_count": len(outcome.results),
+        "headline_metrics": headline,
+        **outcome.summary(),
     }
-    print(json.dumps(plan, indent=2, ensure_ascii=False))
-    return 0
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0 if outcome.failed == 0 and outcome.invalid_input == 0 else 1
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    config = _load_config_or_exit(args.config)
+    return _execute_resume(config, args)
 
 
 def cmd_compare(args: argparse.Namespace) -> int:
@@ -255,8 +343,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("--run", required=True, metavar="DIR")
     p_report.set_defaults(func=cmd_report)
 
-    p_resume = sub.add_parser("resume", help="resume a run from checkpoints (M2)")
+    p_resume = sub.add_parser(
+        "resume", help="resume a run from its checkpoint directory"
+    )
     p_resume.add_argument("--config", required=True)
+    p_resume.add_argument(
+        "--run",
+        required=True,
+        metavar="DIR",
+        help="existing run directory to resume (must match the config)",
+    )
+    p_resume.add_argument(
+        "--dataset",
+        default=None,
+        metavar="JSON",
+        help="manual dataset fixture (default: the bundled smoke samples)",
+    )
     p_resume.set_defaults(func=cmd_resume)
 
     p_compare = sub.add_parser("compare", help="compare two runs (M2)")
