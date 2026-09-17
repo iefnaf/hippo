@@ -240,7 +240,17 @@ class StageAttempt(ContractModel):
 
 
 class MetricResult(ContractModel):
-    """One metric outcome for a sample; metric_id must be registered."""
+    """One metric outcome for a sample; metric_id must be registered.
+
+    Per-sample rows REUSE the aggregate-level metric_id (issue #3
+    leftover, documented): e.g. a sample carrying
+    verifiable_session_recall_macro=0.5 holds that sample's own recall,
+    while the same id in report.json holds the macro average over the
+    applicable set E. Consumers that aggregate from samples.jsonl (the
+    compare command) therefore identify a metric by metric_id and know
+    its per-sample semantics from the registry denominator — there is
+    no separate per-sample id namespace.
+    """
 
     metric_id: str
     status: Literal["computed", "not_supported", "not_applicable", "pending"]

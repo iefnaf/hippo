@@ -308,7 +308,7 @@ Result 仅承载最小进度及产物索引，详细输入、原始 Evidence、P
 
 qa suite 的 operation_status 为 null；operations suite 的 qa_status/correct 为 null。QA `scored` 时 correct 必须为布尔值；failed、context_exceeded、pending 时为 null，不捏造错误回答。失败按零分计入主设计的整体指标是 Reporter 的聚合规则，不通过设置 correct=false 混淆失败和已评分错误。invalid_input 阻塞或使正式 run 无效。
 
-`metric_id` 必须来自指标注册表；注册表未登记的指标只能作为明确标记的诊断项，不进入比较和排名。MetricResult.computed 必须有数值，其他状态为 null 并附 reason。原文检索适用题发生写入/检索失败时，recall 仍按空 R 计算为零，并保留失败阶段；生成模式、拒答题或无排名基线按各自原因记 N/A。Reader/Judge 失败保留已经完成的 recall，后续恢复复用实际证据。操作失败与不支持分别记录，不用 unknown 算通过。
+`metric_id` 必须来自指标注册表；注册表未登记的指标只能作为明确标记的诊断项，不进入比较和排名。MetricResult.computed 必须有数值，其他状态为 null 并附 reason。逐题 `MetricResult` 复用聚合级 `metric_id`：同一条 `verifiable_session_recall_macro` 在 samples.jsonl 里表示该题自身的 recall，在 report.json 里表示适用集合 E 上的宏平均；从 samples.jsonl 聚合的消费方（如 compare 命令）按 `metric_id` 识别指标，其逐题语义由注册表的分母定义给出，不引入独立的 per-sample id 命名空间（issue #3 遗留备注的文档化处置）。原文检索适用题发生写入/检索失败时，recall 仍按空 R 计算为零，并保留失败阶段；生成模式、拒答题或无排名基线按各自原因记 N/A。Reader/Judge 失败保留已经完成的 recall，后续恢复复用实际证据。操作失败与不支持分别记录，不用 unknown 算通过。
 
 实施时至少检查：类型及必填字段、时间精度、匿名 ID 隔离、原文范围与文本一致、generated 来源不参与原文 recall、不渲染诊断来源、裁剪后证据一致、完整 token 预算、回执完成及错误效果、稳定操作 ID、阶段输出存在性、费用去重及恢复指纹。Evidence 不含记忆身份与状态字段，操作目标只取自 `MutationReceipt`、状态断言只经 `inspect` 取得；无法按约定格式解析的来源时间不进入 Reader；文本与格式开销可分别统计。两个 JSON 示例应能按 Evidence 契约加载；带错偏移、伪造来源、未知失败效果及在证据上携带身份或状态的样本必须被检测。
 

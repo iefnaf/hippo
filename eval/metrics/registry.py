@@ -32,12 +32,31 @@ from pydantic import Field, model_validator
 from eval.contracts.common import ContractModel
 
 #: Registry schema/artifact version. Any change to metric definitions, k
-#: sets or N/A semantics bumps this (it is a content-derived version: the
-#: registry_version constant and the content fingerprint below both move).
+#: sets or N/A semantics bumps this.
 REGISTRY_VERSION = "1"
 
-#: Version string used by the config fingerprint; binds registry content.
-REGISTRY_CONTENT_VERSION = "metrics-registry@1"
+
+def _registry_content_fingerprint() -> str:
+    """sha256 over the canonical rendering of every registry entry.
+
+    Computed from content instead of a hand-maintained constant so that
+    editing any definition (or reordering entries) changes the string
+    even when someone forgets to bump REGISTRY_VERSION. The value enters
+    the experiment config fingerprint, keeping runs and comparisons
+    bound to the registry content they were produced under.
+    """
+    import hashlib
+    import json
+
+    payload = json.dumps(
+        [m.model_dump(mode="json") for m in _METRICS],
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 
 EvidenceMode = Literal[
     "extractive",   # requires verifiable extractive evidence
@@ -380,6 +399,13 @@ _METRICS: tuple[MetricDefinition, ...] = (
 
 #: metric_id -> definition (insertion order preserved).
 REGISTRY: dict[str, MetricDefinition] = {m.metric_id: m for m in _METRICS}
+
+#: Version string used by the config fingerprint; binds registry CONTENT
+#: (issue #1 leftover): "<kind>@<version>+<content sha256[:12]>". Derived
+#: from the entries above, so any definition edit moves it automatically.
+REGISTRY_CONTENT_VERSION = (
+    f"metrics-registry@{REGISTRY_VERSION}+{_registry_content_fingerprint()[:12]}"
+)
 
 #: Formal ranking metric ids (used by comparison guards).
 RANKING_METRIC_IDS = frozenset(

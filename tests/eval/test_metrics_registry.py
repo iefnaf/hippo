@@ -75,7 +75,30 @@ class TestRegistryContent:
 
     def test_registry_version_is_v1_and_stable(self):
         assert REGISTRY_VERSION == "1"
-        assert REGISTRY_CONTENT_VERSION == "metrics-registry@1"
+
+    def test_content_version_is_derived_from_registry_content(self):
+        # Issue #1 leftover: the version string that enters the config
+        # fingerprint is a content hash, not a hand-maintained constant.
+        assert REGISTRY_CONTENT_VERSION.startswith("metrics-registry@1+")
+        suffix = REGISTRY_CONTENT_VERSION.split("+", 1)[1]
+        assert len(suffix) == 12
+        int(suffix, 16)  # hex
+
+    def test_content_version_moves_when_a_definition_edits(self):
+        import hashlib
+        import json
+
+        from eval.metrics.registry import _registry_content_fingerprint
+
+        entries = [m.model_dump(mode="json") for m in registry_entries()]
+        edited = [dict(e) for e in entries]
+        edited[0]["description"] = edited[0]["description"] + " (edited)"
+        payload = json.dumps(
+            edited, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        )
+        other = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        assert other[:12] != _registry_content_fingerprint()[:12]
+        assert other[:12] != REGISTRY_CONTENT_VERSION.split("+", 1)[1]
 
     def test_entries_are_stable_across_calls(self):
         first = [m.metric_id for m in registry_entries()]

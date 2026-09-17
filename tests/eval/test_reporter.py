@@ -224,7 +224,9 @@ class TestHappyPathReport:
     def test_registry_version_and_header(self, report):
         header = report["header"]
         assert header["metrics_registry_version"] == "1"
-        assert header["metrics_registry_content_version"] == "metrics-registry@1"
+        assert header["metrics_registry_content_version"].startswith(
+            "metrics-registry@1+"
+        )
         assert header["config_fingerprint"]
         assert header["reader_model_family"] != header["judge_model_family"]
         # Happy path: no invalid-input or pending caveats in limitations.
@@ -244,7 +246,7 @@ class TestHappyPathReport:
         ):
             assert section in markdown
         assert "hit_wrong = 4" in markdown
-        assert "metrics-registry@1" in markdown
+        assert "metrics-registry@1+" in markdown
 
 
 class TestFailurePathReports:

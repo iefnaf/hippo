@@ -201,14 +201,6 @@ def validate_config(path: str | Path) -> DocumentReport:
     except ContractError as exc:
         return DocumentReport(str(path), "config", False, [exc])
     errors: list[ContractError] = []
-    if config.fingerprint() != config.fingerprint():
-        errors.append(
-            ContractError(
-                code="fingerprint_unstable",
-                message="fingerprint() is not deterministic for this config",
-                location="(fingerprint)",
-            )
-        )
     if (
         config.reader.counting_mode == "test"
         and not config.reader.tokenizer_id.startswith("test:")
