@@ -28,6 +28,19 @@ survive in the Result while qa_status records the failed stage. Ingest,
 retrieve and prepare failures still score recall with an empty retained
 set (zero, not excluded) per the design's denominator rules.
 
+Failure handling (issue #5): transient read-only/reader/judge errors
+retry a bounded, configured number of times with every attempt
+recorded (stage, reason, timing, usage); answer quality is never a
+retry reason. Mutations use stable operation ids: transient errors
+with effect=none re-submit the same id; uncertain outcomes
+(effect=possible, e.g. a lost submit response) re-submit only on
+idempotent adapters and otherwise isolate the old task (namespace
+reset) and replay the operation log, bounded by max_sample_replays.
+await_ready runs under a runner-side wall clock whose expiry is
+recorded as await_ready_timeout. Retries and replays are marked
+attempt_kind='retry'/'replay' and their usage reports separately from
+logical usage while still counting into run totals.
+
 RunnerBase carries the machinery shared with the operations suite
 (eval.operations): attempt recording with usage capture, lifecycle
 logging, mutation submission with completion confirmation and the
@@ -84,6 +97,29 @@ QueryStages = ("ingest", "await_ready", "retrieve", "prepare", "read", "score", 
 
 class _StageFailure(Exception):
     """Internal control flow: the sample failed at a stage."""
+
+    def __init__(self, stage: str, error: ErrorInfo) -> None:
+        super().__init__(f"{stage}: {error.code}")
+        self.stage = stage
+        self.error = error
+
+
+class _AwaitTimeout(Exception):
+    """await_ready exceeded the runner-side wall-clock budget."""
+
+    def __init__(self, error: ErrorInfo) -> None:
+        super().__init__(f"await_ready: {error.code}")
+        self.error = error
+
+
+class _UncertainMutation(Exception):
+    """A mutation outcome is uncertain and the adapter offers no
+    idempotent re-submit.
+
+    The runner must NOT re-submit the modification; the caller isolates
+    the old task (namespace reset) and replays the operation log into
+    the fresh space (docs/design/eval-harness.md, 失败处理与恢复).
+    """
 
     def __init__(self, stage: str, error: ErrorInfo) -> None:
         super().__init__(f"{stage}: {error.code}")
@@ -171,6 +207,7 @@ class RunnerBase:
         run_id: str,
         clock: Callable[[], str] = now_utc,
         monotonic: Callable[[], float] = time.perf_counter,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.config = config
         self.adapter = adapter
@@ -178,6 +215,7 @@ class RunnerBase:
         self.run_id = run_id
         self._clock = clock
         self._monotonic = monotonic
+        self._sleep = sleep
         self._attempt_seq = 0
         self._lifecycle_entries: list[AttemptEntry] = []
 
@@ -206,6 +244,10 @@ class RunnerBase:
     def _op_id(self, namespace: str, stage: str, seq: int, payload: Any) -> str:
         return _operation_id(self.run_id, namespace, stage, seq, payload)
 
+    def _backoff_seconds(self, retry_index: int) -> float:
+        """Deterministic 1s/4s/16s-shaped backoff (base * 4**k)."""
+        return self.config.run_params.backoff_base_s * (4**retry_index)
+
     def _record_call(
         self,
         *,
@@ -217,6 +259,7 @@ class RunnerBase:
         fn: Callable[[], Any],
         error_transform: Callable[[Exception], ErrorInfo] | None = None,
         usage_from: Callable[[Any], ResourceUsage | None] | None = None,
+        attempt_kind: str = "logical",
     ) -> tuple[Any | None, StageAttempt, AttemptEntry, ErrorInfo | None]:
         attempt_id = self._next_attempt_id(stage)
         started_at = self._clock()
@@ -265,6 +308,7 @@ class RunnerBase:
             output_ref=(None if error is not None else inline_ref(_jsonable(result))),
             error=error,
             usage=usage,
+            attempt_kind=attempt_kind,  # type: ignore[arg-type]
         )
         entry = AttemptEntry(
             attempt_id=attempt_id,
@@ -279,12 +323,18 @@ class RunnerBase:
             output=output_json,
             error=error,
             usage=usage,
+            attempt_kind=attempt_kind,  # type: ignore[arg-type]
         )
         return result, stage_attempt, entry, error
 
     def _record_lifecycle(
-        self, method: str, namespace: str, fn: Callable[[], None]
+        self,
+        method: str,
+        namespace: str,
+        fn: Callable[[], None],
+        attempt_kind: str = "logical",
     ) -> None:
+        self._attempt_seq += 1
         started_at = self._clock()
         t0 = self._monotonic()
         error: ErrorInfo | None = None
@@ -314,15 +364,84 @@ class RunnerBase:
                 output=None,
                 error=error,
                 usage=None,
+                attempt_kind=attempt_kind,  # type: ignore[arg-type]
             )
         )
-        self._attempt_seq += 1
         if error is not None:
             # Lifecycle calls failing after the sample already failed are
             # diagnostics; they never overwrite the failed stage.
             pass
 
     # -- mutation submission ------------------------------------------------
+
+    def _mutation_retry_allowed(self, error: ErrorInfo, idempotent: bool) -> bool:
+        """Transient re-submit rule for mutation attempts.
+
+        effect=none (definitely not applied, never will be): bounded
+        re-submit with the same operation id. effect=possible (uncertain
+        outcome): only an idempotent adapter may see the same id again —
+        it dedups to one logical mutation; without idempotency the same
+        id must never be re-sent (isolation+replay instead).
+        """
+        if not error.transient:
+            return False
+        if error.effect == "none":
+            return True
+        return error.effect == "possible" and idempotent
+
+    def _record_call_with_retries(
+        self,
+        *,
+        stage: str,
+        method: str,
+        namespace: str,
+        operation_id: str | None,
+        input_payload: dict[str, Any],
+        fn: Callable[[], Any],
+        attempts: list[StageAttempt],
+        entries: list[AttemptEntry],
+        error_transform: Callable[[Exception], ErrorInfo] | None = None,
+        usage_from: Callable[[Any], ResourceUsage | None] | None = None,
+        retryable: Callable[[ErrorInfo], bool] | None = None,
+        attempt_kind: str = "logical",
+    ) -> Any:
+        """Record a call with bounded retries on transient errors.
+
+        Used for read-only adapter calls and reader answers: every
+        attempt (failed or not) is recorded with stage, reason, timing
+        and usage; retries are marked attempt_kind='retry' so recovery
+        usage is reported separately. A non-transient error fails the
+        stage immediately, and nothing about answer quality is ever a
+        retry reason.
+        """
+        retries = 0
+        kind = attempt_kind
+        while True:
+            result, attempt, entry, error = self._record_call(
+                stage=stage,
+                method=method,
+                namespace=namespace,
+                operation_id=operation_id,
+                input_payload=input_payload,
+                fn=fn,
+                error_transform=error_transform,
+                usage_from=usage_from,
+                attempt_kind=kind,
+            )
+            attempts.append(attempt)
+            entries.append(entry)
+            if error is None:
+                return result
+            if (
+                retryable is not None
+                and retryable(error)
+                and retries < self.config.run_params.max_retries
+            ):
+                self._sleep(self._backoff_seconds(retries))
+                retries += 1
+                kind = "retry"
+                continue
+            raise _StageFailure(stage, error)
 
     def _submit_mutation(
         self,
@@ -336,46 +455,83 @@ class RunnerBase:
         attempts: list[StageAttempt],
         entries: list[AttemptEntry],
         stage_states: dict[str, str] | None = None,
+        attempt_kind: str = "logical",
     ) -> MutationReceipt:
         """Submit one mutation and confirm completion before returning.
 
-        Accepted receipts are awaited on the SAME operation id; the
-        submit and the wait are both recorded. Anything other than a
-        completed receipt fails the stage.
+        Retry policy (docs/design/eval-harness.md, 失败处理与恢复):
+        transient+effect=none re-submits the SAME operation id; an
+        uncertain outcome (effect=possible, e.g. a lost submit response)
+        re-submits only on idempotent adapters (one logical mutation)
+        and otherwise raises _UncertainMutation so the caller isolates
+        the old task and replays; an already-accepted async task is
+        only ever awaited on its own operation id; await_ready is
+        bounded by a runner-side wall clock and its timeout is recorded
+        as a stage failure (await_ready_timeout).
         """
-        receipt, attempt, entry, error = self._record_call(
-            stage=stage,
-            method=method,
-            namespace=namespace,
-            operation_id=operation_id,
-            input_payload=input_payload,
-            fn=fn,
-        )
-        attempts.append(attempt)
-        entries.append(entry)
-        if error is not None:
-            raise _StageFailure(stage, error)
-        assert receipt is not None
-        self._check_receipt_identity(receipt, operation_id, stage)
-        final: MutationReceipt = receipt
-        if receipt.status == "accepted":
-            final = self._await_ready(namespace, operation_id, attempts, entries)
-            if stage_states is not None:
-                stage_states["await_ready"] = "completed"
-        if final.status != "completed":
-            failure = final.error or ErrorInfo(
-                code="mutation_not_completed",
-                message=(
-                    f"{method} ended in status {final.status!r} without "
-                    "a completion confirmation"
-                ),
-                effect="possible",
-                transient=False,
+        idempotent = "idempotent_mutation" in set(self.adapter.capabilities())
+        max_retries = self.config.run_params.max_retries
+        tries = 0
+        kind = attempt_kind
+        while True:
+            receipt, attempt, entry, error = self._record_call(
+                stage=stage,
+                method=method,
+                namespace=namespace,
+                operation_id=operation_id,
+                input_payload=input_payload,
+                fn=fn,
+                attempt_kind=kind,
             )
-            raise _StageFailure(stage, failure)
-        if stage_states is not None:
-            stage_states[stage] = "completed"
-        return final
+            attempts.append(attempt)
+            entries.append(entry)
+            if error is not None:
+                if (
+                    self._mutation_retry_allowed(error, idempotent)
+                    and tries < max_retries
+                ):
+                    self._sleep(self._backoff_seconds(tries))
+                    tries += 1
+                    kind = "retry"
+                    continue
+                if error.effect == "possible" and not idempotent:
+                    raise _UncertainMutation(stage, error)
+                raise _StageFailure(stage, error)
+            assert receipt is not None
+            self._check_receipt_identity(receipt, operation_id, stage)
+            final: MutationReceipt = receipt
+            if receipt.status == "accepted":
+                try:
+                    final = self._await_ready(
+                        namespace, operation_id, attempts, entries, attempt_kind=kind
+                    )
+                except _AwaitTimeout as exc:
+                    if idempotent and tries < max_retries:
+                        # Same-id re-submit: for an idempotent async
+                        # backend this is a status query of the original
+                        # operation, never a new mutation.
+                        tries += 1
+                        kind = "retry"
+                        continue
+                    if not idempotent:
+                        raise _UncertainMutation("await_ready", exc.error) from exc
+                    raise _StageFailure("await_ready", exc.error) from exc
+                if stage_states is not None:
+                    stage_states["await_ready"] = "completed"
+            if final.status != "completed":
+                failure = final.error or ErrorInfo(
+                    code="mutation_not_completed",
+                    message=(
+                        f"{method} ended in status {final.status!r} without "
+                        "a completion confirmation"
+                    ),
+                    effect="possible",
+                    transient=False,
+                )
+                raise _StageFailure(stage, failure)
+            if stage_states is not None:
+                stage_states[stage] = "completed"
+            return final
 
     def _await_ready(
         self,
@@ -383,9 +539,45 @@ class RunnerBase:
         operation_id: str,
         attempts: list[StageAttempt],
         entries: list[AttemptEntry],
+        attempt_kind: str = "logical",
     ) -> MutationReceipt:
+        """Poll the SAME operation id under a runner-side wall clock.
+
+        The adapter timeout bounds a single poll; this loop bounds the
+        TOTAL wait via self._monotonic so a backend that accepts but
+        never finishes cannot hang the run (issue #2 close-out note).
+        Exceeding the budget records an await_ready_timeout attempt
+        (stage, reason, timing, usage) and raises _AwaitTimeout —
+        waiting past the configured budget is a recorded failure, never
+        an unbounded hang.
+        """
         timeout = self.config.run_params.await_ready_timeout_s
+        deadline = self._monotonic() + timeout
         while True:
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                self._record_await_timeout(
+                    namespace,
+                    operation_id,
+                    attempts,
+                    entries,
+                    waited_s=timeout,
+                    attempt_kind=attempt_kind,
+                )
+                raise _AwaitTimeout(
+                    ErrorInfo(
+                        code="await_ready_timeout",
+                        message=(
+                            f"operation {operation_id!r} did not reach a "
+                            f"terminal state within the runner-side wall-"
+                            f"clock budget of {timeout:g}s; recorded as a "
+                            "failure (effect uncertain)"
+                        ),
+                        effect="possible",
+                        transient=False,
+                    )
+                )
+            poll_timeout = round(min(timeout, remaining), 6)
             receipt, attempt, entry, error = self._record_call(
                 stage="await_ready",
                 method="await_ready",
@@ -393,19 +585,88 @@ class RunnerBase:
                 operation_id=operation_id,
                 input_payload={
                     "operation_id": operation_id,
-                    "timeout_s": timeout,
+                    "timeout_s": poll_timeout,
                 },
-                fn=lambda: self.adapter.await_ready(namespace, operation_id, timeout),
+                fn=lambda: self.adapter.await_ready(
+                    namespace, operation_id, poll_timeout
+                ),
+                attempt_kind=attempt_kind,
             )
             attempts.append(attempt)
             entries.append(entry)
             if error is not None:
+                if error.transient:
+                    # Keep polling the SAME operation within the budget.
+                    self._sleep(min(remaining, self._backoff_seconds(0)))
+                    continue
                 raise _StageFailure("await_ready", error)
             assert receipt is not None
             self._check_receipt_identity(receipt, operation_id, "await_ready")
             if receipt.status in ("completed", "failed"):
                 return receipt
             # still accepted: keep waiting on the SAME operation id
+
+    def _record_await_timeout(
+        self,
+        namespace: str,
+        operation_id: str,
+        attempts: list[StageAttempt],
+        entries: list[AttemptEntry],
+        *,
+        waited_s: float,
+        attempt_kind: str,
+    ) -> None:
+        """Record the wall-clock timeout itself as a failed attempt."""
+        error = ErrorInfo(
+            code="await_ready_timeout",
+            message=(
+                f"operation {operation_id!r} did not reach a terminal state "
+                f"within the runner-side wall-clock budget of {waited_s:g}s; "
+                "recorded as a failure (effect uncertain)"
+            ),
+            effect="possible",
+            transient=False,
+        )
+        started_at = self._clock()
+        attempt_id = self._next_attempt_id("await_ready")
+        attempts.append(
+            StageAttempt(
+                attempt_id=attempt_id,
+                stage="await_ready",
+                operation_id=operation_id,
+                outcome="error",
+                started_at=started_at,
+                ended_at=self._clock(),
+                elapsed_ms=round(waited_s * 1000.0, 3),
+                input_ref=inline_ref(
+                    {"operation_id": operation_id, "timeout_s": waited_s}
+                ),
+                output_ref=None,
+                error=error,
+                usage=None,
+                attempt_kind=attempt_kind,  # type: ignore[arg-type]
+            )
+        )
+        entries.append(
+            AttemptEntry(
+                attempt_id=attempt_id,
+                stage="await_ready",
+                method="await_ready.wall_clock",
+                namespace=namespace,
+                operation_id=operation_id,
+                started_at=started_at,
+                ended_at=self._clock(),
+                elapsed_ms=round(waited_s * 1000.0, 3),
+                input={
+                    "operation_id": operation_id,
+                    "timeout_s": waited_s,
+                },
+                output=None,
+                error=error,
+                usage=None,
+                attempt_kind=attempt_kind,  # type: ignore[arg-type]
+            )
+        )
 
     def _check_receipt_identity(
         self, receipt: MutationReceipt, operation_id: str, stage: str
@@ -465,6 +726,9 @@ class OfflineRunner(RunnerBase):
             protocol_id=config.judge.protocol_id,
             clock=clock,
             monotonic=monotonic,
+            max_retries=config.run_params.max_retries,
+            backoff_base_s=config.run_params.backoff_base_s,
+            sleep=self._sleep,
         )
 
     # -- pre-run checks ----------------------------------------------------
@@ -540,6 +804,140 @@ class OfflineRunner(RunnerBase):
 
     # -- per-sample loop ----------------------------------------------------
 
+    def _ingest_phase(
+        self,
+        handle: str,
+        namespace: str,
+        sessions: list[Any],
+        attempts: list[StageAttempt],
+        entries: list[AttemptEntry],
+        stage_states: dict[str, str],
+    ) -> None:
+        """open -> ingest (exactly the current session) -> completion
+        confirmation -> close, per session.
+
+        An uncertain mutation outcome on a NON-idempotent adapter raises
+        _UncertainMutation: the namespace is then reset (isolating the
+        old task together with the uncertain space) and the whole
+        operation log is replayed into the fresh space, bounded by
+        run_params.max_sample_replays. Replay calls are marked
+        attempt_kind='replay' so their usage reports as recovery.
+        """
+        replays = 0
+        kind = "logical"
+        while True:
+            try:
+                for i, session in enumerate(sessions):
+                    self._record_lifecycle(
+                        "open",
+                        namespace,
+                        lambda: self.adapter.open(namespace),
+                        attempt_kind=kind,
+                    )
+                    operation_id = self._op_id(
+                        namespace, "ingest", i, session.model_dump(mode="json")
+                    )
+                    self._submit_mutation(
+                        stage="ingest",
+                        method="ingest",
+                        namespace=namespace,
+                        operation_id=operation_id,
+                        input_payload={
+                            "session": session.model_dump(mode="json"),
+                            "operation_id": operation_id,
+                        },
+                        fn=lambda: self.adapter.ingest(
+                            namespace, session, operation_id
+                        ),
+                        attempts=attempts,
+                        entries=entries,
+                        stage_states=stage_states,
+                        attempt_kind=kind,
+                    )
+                    self._record_lifecycle(
+                        "close",
+                        namespace,
+                        lambda: self.adapter.close(namespace),
+                        attempt_kind=kind,
+                    )
+                stage_states["ingest"] = "completed"
+                return
+            except _UncertainMutation as exc:
+                if exc.stage in stage_states:
+                    stage_states[exc.stage] = "failed"
+                if replays >= self.config.run_params.max_sample_replays:
+                    raise _StageFailure(exc.stage, exc.error) from exc
+                replays += 1
+                # Isolation: discard the uncertain space; the adapter
+                # quarantines its in-flight tasks with it.
+                self._record_lifecycle(
+                    "reset",
+                    namespace,
+                    lambda: self.adapter.reset(namespace),
+                    attempt_kind="replay",
+                )
+                kind = "replay"
+
+    def _retrieve_stage(
+        self,
+        handle: str,
+        namespace: str,
+        attempts: list[StageAttempt],
+        entries: list[AttemptEntry],
+    ) -> list[Evidence]:
+        """Read-only retrieve with bounded transient retries."""
+        request = self.dataset.build_retrieval_request(
+            handle, self.config.evidence_token_budget
+        )
+        raw = self._record_call_with_retries(
+            stage="retrieve",
+            method="retrieve",
+            namespace=namespace,
+            operation_id=None,
+            input_payload={"request": request.model_dump(mode="json")},
+            fn=lambda: self.adapter.retrieve(namespace, request),
+            attempts=attempts,
+            entries=entries,
+            retryable=lambda error: error.transient,
+        )
+        assert raw is not None
+        return list(raw)
+
+    def _prepare_stage(
+        self,
+        namespace: str,
+        raw_evidence: list[Evidence],
+        history: HistoryIndex,
+        attempts: list[StageAttempt],
+        entries: list[AttemptEntry],
+    ) -> PreparedEvidence:
+        """Budget preparation is deterministic: no retries, no patching."""
+        tokenizer = TestCharTokenizer()
+        prepared, attempt, entry, error = self._record_call(
+            stage="prepare",
+            method="prepare_evidence",
+            namespace=namespace,
+            operation_id=None,
+            input_payload={
+                "raw_count": len(raw_evidence),
+                "budget": self.config.evidence_token_budget,
+                "history_messages": history.message_count(),
+            },
+            fn=lambda: prepare_evidence(
+                raw_evidence,
+                history,
+                budget=self.config.evidence_token_budget,
+                tokenizer=tokenizer,
+            ),
+            error_transform=_prepare_error_transform,
+        )
+        attempts.append(attempt)
+        entries.append(entry)
+        if error is not None:
+            raise _StageFailure("prepare", error)
+        assert prepared is not None
+        return prepared
+
     def _run_sample(self, handle: str, async_mutation: bool) -> ResultArtifact:
         namespace = self.dataset.namespace_for(handle, self.config.sample_plan_id)
         self._lifecycle_entries = []
@@ -565,80 +963,22 @@ class OfflineRunner(RunnerBase):
         self._record_lifecycle("reset", namespace, lambda: self.adapter.reset(namespace))
 
         try:
-            for i, session in enumerate(sessions):
-                self._record_lifecycle(
-                    "open", namespace, lambda: self.adapter.open(namespace)
-                )
-                operation_id = self._op_id(
-                    namespace, "ingest", i, session.model_dump(mode="json")
-                )
-                self._submit_mutation(
-                    stage="ingest",
-                    method="ingest",
-                    namespace=namespace,
-                    operation_id=operation_id,
-                    input_payload={
-                        "session": session.model_dump(mode="json"),
-                        "operation_id": operation_id,
-                    },
-                    fn=lambda: self.adapter.ingest(namespace, session, operation_id),
-                    attempts=attempts,
-                    entries=entries,
-                    stage_states=stage_states,
-                )
-                self._record_lifecycle(
-                    "close", namespace, lambda: self.adapter.close(namespace)
-                )
-            stage_states["ingest"] = "completed"
+            self._ingest_phase(
+                handle, namespace, sessions, attempts, entries, stage_states
+            )
 
             # Query phase: reopen the persisted space and retrieve.
             self._record_lifecycle(
                 "open", namespace, lambda: self.adapter.open(namespace)
             )
-            request = self.dataset.build_retrieval_request(
-                handle, self.config.evidence_token_budget
-            )
-            raw, attempt, entry, error = self._record_call(
-                stage="retrieve",
-                method="retrieve",
-                namespace=namespace,
-                operation_id=None,
-                input_payload={"request": request.model_dump(mode="json")},
-                fn=lambda: self.adapter.retrieve(namespace, request),
-            )
-            attempts.append(attempt)
-            entries.append(entry)
-            if error is not None:
-                raise _StageFailure("retrieve", error)
-            assert raw is not None
+            raw = self._retrieve_stage(handle, namespace, attempts, entries)
             raw_evidence = list(raw)
             stage_states["retrieve"] = "completed"
 
             history = build_history_index(sessions)
-            tokenizer = TestCharTokenizer()
-            prepared, attempt, entry, error = self._record_call(
-                stage="prepare",
-                method="prepare_evidence",
-                namespace=namespace,
-                operation_id=None,
-                input_payload={
-                    "raw_count": len(raw_evidence),
-                    "budget": self.config.evidence_token_budget,
-                    "history_messages": history.message_count(),
-                },
-                fn=lambda: prepare_evidence(
-                    raw_evidence,
-                    history,
-                    budget=self.config.evidence_token_budget,
-                    tokenizer=tokenizer,
-                ),
-                error_transform=_prepare_error_transform,
+            prepared = self._prepare_stage(
+                namespace, raw_evidence, history, attempts, entries
             )
-            attempts.append(attempt)
-            entries.append(entry)
-            if error is not None:
-                raise _StageFailure("prepare", error)
-            assert prepared is not None
             stage_states["prepare"] = "completed"
         except _StageFailure as exc:
             failed_stage = exc.stage
@@ -649,31 +989,31 @@ class OfflineRunner(RunnerBase):
             # Answer phase: the reader consumes the exact retained evidence.
             question = self.dataset.get_question(handle)
             if failed_stage is None and prepared is not None:
-                reader_result, attempt, entry, error = self._record_call(
-                    stage="read",
-                    method="reader.answer",
-                    namespace=namespace,
-                    operation_id=None,
-                    input_payload={
-                        "question": question.model_dump(mode="json"),
-                        "prepared_token_count": prepared.token_count,
-                        "prepared_units": len(prepared.items),
-                        "tokenizer_id": prepared.tokenizer_id,
-                    },
-                    fn=lambda: self.reader.answer(question, prepared),
-                    error_transform=_reader_error_transform,
-                    usage_from=lambda r: r.usage,
-                )
-                attempts.append(attempt)
-                entries.append(entry)
-                if error is not None:
-                    failed_stage = "read"
-                    failure = error
+                try:
+                    reader_result = self._record_call_with_retries(
+                        stage="read",
+                        method="reader.answer",
+                        namespace=namespace,
+                        operation_id=None,
+                        input_payload={
+                            "question": question.model_dump(mode="json"),
+                            "prepared_token_count": prepared.token_count,
+                            "prepared_units": len(prepared.items),
+                            "tokenizer_id": prepared.tokenizer_id,
+                        },
+                        fn=lambda: self.reader.answer(question, prepared),
+                        attempts=attempts,
+                        entries=entries,
+                        error_transform=_reader_error_transform,
+                        usage_from=lambda r: r.usage,
+                        retryable=lambda error: error.transient,
+                    )
+                    stage_states["read"] = "completed"
+                except _StageFailure as exc:
+                    failed_stage = exc.stage
+                    failure = exc.error
                     stage_states["read"] = "failed"
                     reader_result = None
-                else:
-                    assert reader_result is not None
-                    stage_states["read"] = "completed"
 
             # Scoring: recall from the same prepared evidence + judge
             # verdict. Runs even after ingest/retrieve/prepare/read
@@ -717,51 +1057,57 @@ class OfflineRunner(RunnerBase):
                     )
                 )
 
-            if scoring is not None and scoring.judge_call is not None:
-                call = scoring.judge_call
-                attempt_id = self._next_attempt_id("judge")
-                attempts.append(
-                    StageAttempt(
-                        attempt_id=attempt_id,
-                        stage="judge",
-                        operation_id=None,
-                        outcome="error" if call.error is not None else "returned",
-                        started_at=call.started_at,
-                        ended_at=call.ended_at,
-                        elapsed_ms=call.elapsed_ms,
-                        input_ref=inline_ref(call.request.model_dump(mode="json")),
-                        output_ref=(
-                            None
-                            if call.error is not None
-                            else inline_ref(call.result.model_dump(mode="json"))
-                        ),
-                        error=call.error,
-                        usage=call.usage,
+            if scoring is not None and scoring.judge_attempts:
+                for idx, call in enumerate(scoring.judge_attempts):
+                    attempt_id = self._next_attempt_id("judge")
+                    kind = "logical" if idx == 0 else "retry"
+                    attempts.append(
+                        StageAttempt(
+                            attempt_id=attempt_id,
+                            stage="judge",
+                            operation_id=None,
+                            outcome=("error" if call.error is not None else "returned"),
+                            started_at=call.started_at,
+                            ended_at=call.ended_at,
+                            elapsed_ms=call.elapsed_ms,
+                            input_ref=inline_ref(
+                                call.request.model_dump(mode="json")
+                            ),
+                            output_ref=(
+                                None
+                                if call.error is not None
+                                else inline_ref(call.result.model_dump(mode="json"))
+                            ),
+                            error=call.error,
+                            usage=call.usage,
+                            attempt_kind=kind,
+                        )
                     )
-                )
-                entries.append(
-                    AttemptEntry(
-                        attempt_id=attempt_id,
-                        stage="judge",
-                        method="judge.evaluate",
-                        namespace=namespace,
-                        operation_id=None,
-                        started_at=call.started_at,
-                        ended_at=call.ended_at,
-                        elapsed_ms=call.elapsed_ms,
-                        input={"request": call.request.model_dump(mode="json")},
-                        output=(
-                            None
-                            if call.error is not None
-                            else call.result.model_dump(mode="json")
-                        ),
-                        error=call.error,
-                        usage=call.usage,
+                    entries.append(
+                        AttemptEntry(
+                            attempt_id=attempt_id,
+                            stage="judge",
+                            method="judge.evaluate",
+                            namespace=namespace,
+                            operation_id=None,
+                            started_at=call.started_at,
+                            ended_at=call.ended_at,
+                            elapsed_ms=call.elapsed_ms,
+                            input={"request": call.request.model_dump(mode="json")},
+                            output=(
+                                None
+                                if call.error is not None
+                                else call.result.model_dump(mode="json")
+                            ),
+                            error=call.error,
+                            usage=call.usage,
+                            attempt_kind=kind,
+                        )
                     )
-                )
-                if call.error is not None:
+                final_call = scoring.judge_attempts[-1]
+                if final_call.error is not None:
                     failed_stage = "judge"
-                    failure = call.error
+                    failure = final_call.error
                     stage_states["judge"] = "failed"
                 else:
                     stage_states["judge"] = "completed"
@@ -805,16 +1151,22 @@ class OfflineRunner(RunnerBase):
             if reader_result is not None
             else None
         )
+        successful_judge = (
+            next(
+                (c for c in scoring.judge_attempts if c.result is not None),
+                None,
+            )
+            if scoring is not None
+            else None
+        )
         judge_artifact = (
             JudgeRecordArtifact(
                 run_id=self.run_id,
                 sample_handle=handle,
-                request=scoring.judge_call.request,
-                result=scoring.judge_call.result,
+                request=successful_judge.request,
+                result=successful_judge.result,
             )
-            if scoring is not None
-            and scoring.judge_call is not None
-            and scoring.judge_call.result is not None
+            if successful_judge is not None
             else None
         )
         refs = self.store.write_sample_artifacts(

@@ -27,6 +27,13 @@ from eval.contracts.common import (
 
 Attribution = Literal["hit_correct", "hit_wrong", "miss_correct", "miss_wrong"]
 
+#: Attempt classification for the usage split: a call that is part
+#: of the plan's first execution is "logical"; bounded retries after
+#: a failed attempt are "retry"; isolation+replay (and resume) calls
+#: are "replay". Retry and replay usage both count into run totals
+#: and are reported separately from logical usage.
+ATTEMPT_KINDS = ("logical", "retry", "replay")
+
 #: Stage names of the run pipeline (fixed in M1). "update", "delete"
 #: and "inspect" are the operations-suite stages: explicit mutations and
 #: the only state-observation channel.
@@ -199,6 +206,7 @@ class StageAttempt(ContractModel):
     output_ref: str | None
     error: ErrorInfo | None
     usage: ResourceUsage | None
+    attempt_kind: Literal["logical", "retry", "replay"] = "logical"
 
     @field_validator("stage")
     @classmethod

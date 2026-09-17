@@ -96,12 +96,22 @@ class JudgePlan(ContractModel):
 
 
 class RunParams(ContractModel):
-    """Retry/timeout/concurrency parameters; changing any is a config change."""
+    """Retry/timeout/concurrency parameters; changing any is a config change.
+
+    max_retries bounds RETRIES after a first attempt (transient
+    read-only/reader/judge errors and mutation re-submits under the
+    failure policy); backoff_base_s shapes the 1s/4s/16s schedule
+    (base * 4**k, deterministic in the offline fake path).
+    max_sample_replays bounds isolation+replay cycles when a mutation
+    outcome is uncertain and the adapter offers no idempotent
+    re-submit.
+    """
 
     max_retries: int = Field(default=3, ge=0)
     backoff_base_s: float = Field(default=1.0, gt=0)
     await_ready_timeout_s: float = Field(default=300.0, gt=0)
     question_concurrency: int = Field(default=1, ge=1)
+    max_sample_replays: int = Field(default=1, ge=0)
 
 
 class ExperimentConfig(ContractModel):

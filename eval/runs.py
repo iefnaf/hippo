@@ -109,6 +109,7 @@ class AttemptEntry(SchemaVersionedModel):
     output: Any = None
     error: ErrorInfo | None = None
     usage: ResourceUsage | None = None
+    attempt_kind: Literal["logical", "retry", "replay"] = "logical"
 
 
 class AttemptLogArtifact(SchemaVersionedModel):

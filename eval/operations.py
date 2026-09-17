@@ -55,7 +55,7 @@ from eval.contracts.internal import (
     StageAttempt,
 )
 from eval.datasets.manual import namespace_for
-from eval.runner import RunnerBase, _StageFailure
+from eval.runner import RunnerBase, _StageFailure, _UncertainMutation
 from eval.runs import (
     AttemptEntry,
     AttemptLogArtifact,
@@ -231,6 +231,10 @@ class _CheckRun:
     stage_states: dict[str, str] = field(default_factory=dict)
     assertions: list[CheckAssertion] = field(default_factory=list)
     target_ids: list[str] = field(default_factory=list)
+    #: attempt classification for this execution cycle: replay cycles
+    #: (isolation+replay of an uncertain mutation) mark their calls as
+    #: recovery usage.
+    attempt_kind: str = "logical"
 
 
 @dataclass
@@ -416,12 +420,6 @@ class OperationsRunner(RunnerBase):
         self, check_id: str, capabilities: set[str]
     ) -> tuple[ResultArtifact, OperationCheckDetail]:
         namespace = namespace_for(self.config.sample_plan_id, check_id)
-        ctx = _CheckRun(
-            check_id=check_id,
-            namespace=namespace,
-            namespaces=[namespace],
-            stage_states={stage: "pending" for stage in CHECK_STAGES[check_id]},
-        )
         self._lifecycle_entries = []
         required = CHECK_REQUIREMENTS[check_id]
         missing = tuple(c for c in required if c not in capabilities)
@@ -429,6 +427,12 @@ class OperationsRunner(RunnerBase):
         status = "passed"
         reason: str | None = None
         failed_stage: str | None = None
+        ctx = _CheckRun(
+            check_id=check_id,
+            namespace=namespace,
+            namespaces=[namespace],
+            stage_states={stage: "pending" for stage in CHECK_STAGES[check_id]},
+        )
         if missing:
             # Undeclared optional capabilities are decided BEFORE the run:
             # the item is not_supported, not a failure, and never a pass.
@@ -438,21 +442,64 @@ class OperationsRunner(RunnerBase):
                 f"check requires {list(required)}"
             )
         else:
-            try:
-                getattr(self, f"_check_{check_id}")(ctx)
-            except _NotSupported as exc:
-                status = "not_supported"
-                reason = exc.reason
-            except (_StageFailure, _CheckFailure) as exc:
-                status = "failed"
-                failed_stage = exc.stage
-                ctx.stage_states[exc.stage] = "failed"
-            finally:
-                for ns in sorted(ctx.open_namespaces):
-                    self._record_lifecycle(
-                        "close", ns, lambda ns=ns: self.adapter.close(ns)
+            replays = 0
+            while True:
+                try:
+                    getattr(self, f"_check_{check_id}")(ctx)
+                    break
+                except _NotSupported as exc:
+                    status = "not_supported"
+                    reason = exc.reason
+                    break
+                except _UncertainMutation as exc:
+                    # Same isolation+replay policy as the QA loop: reset
+                    # every space the failed cycle touched and re-run the
+                    # deterministic check from its own operation log.
+                    if exc.stage in ctx.stage_states:
+                        ctx.stage_states[exc.stage] = "failed"
+                    if replays >= self.config.run_params.max_sample_replays:
+                        status = "failed"
+                        failed_stage = exc.stage
+                        reason = (
+                            f"uncertain mutation outcome at {exc.stage} "
+                            f"({exc.error.code}) and the isolation+replay "
+                            f"budget of "
+                            f"{self.config.run_params.max_sample_replays} is "
+                            "exhausted; recorded as failed, never guessed"
+                        )
+                        break
+                    replays += 1
+                    stale = list(dict.fromkeys(ctx.namespaces + [namespace]))
+                    for ns in stale:
+                        self._record_lifecycle(
+                            "reset",
+                            ns,
+                            lambda ns=ns: self.adapter.reset(ns),
+                            attempt_kind="replay",
+                        )
+                    ctx = _CheckRun(
+                        check_id=check_id,
+                        namespace=namespace,
+                        namespaces=[namespace],
+                        stage_states={
+                            stage: "pending" for stage in CHECK_STAGES[check_id]
+                        },
+                        attempts=ctx.attempts,
+                        entries=ctx.entries,
+                        assertions=ctx.assertions,
+                        attempt_kind="replay",
                     )
-                ctx.open_namespaces.clear()
+                except (_StageFailure, _CheckFailure) as exc:
+                    status = "failed"
+                    failed_stage = exc.stage
+                    ctx.stage_states[exc.stage] = "failed"
+                    break
+                finally:
+                    for ns in sorted(ctx.open_namespaces):
+                        self._record_lifecycle(
+                            "close", ns, lambda ns=ns: self.adapter.close(ns)
+                        )
+                    ctx.open_namespaces.clear()
 
         entries = self._lifecycle_entries + ctx.entries
         log_artifact = AttemptLogArtifact(
@@ -531,6 +578,7 @@ class OperationsRunner(RunnerBase):
             attempts=ctx.attempts,
             entries=ctx.entries,
             stage_states=ctx.stage_states,
+            attempt_kind=ctx.attempt_kind,
         )
         self._close(ctx, namespace)
         return receipt
@@ -543,36 +591,36 @@ class OperationsRunner(RunnerBase):
             question_date=OPS_QUESTION_DATE,
             evidence_token_budget=self.config.evidence_token_budget,
         )
-        result, attempt, entry, error = self._record_call(
+        result = self._record_call_with_retries(
             stage="retrieve",
             method="retrieve",
             namespace=namespace,
             operation_id=None,
             input_payload={"request": request.model_dump(mode="json")},
             fn=lambda: self.adapter.retrieve(namespace, request),
+            attempts=ctx.attempts,
+            entries=ctx.entries,
+            retryable=lambda error: error.transient,
+            attempt_kind=ctx.attempt_kind,
         )
-        ctx.attempts.append(attempt)
-        ctx.entries.append(entry)
-        if error is not None:
-            raise _StageFailure("retrieve", error)
         assert result is not None
         return list(result)
 
     def _inspect(
         self, ctx: _CheckRun, namespace: str, memory_ids: list[str]
     ) -> dict[str, MemoryState]:
-        result, attempt, entry, error = self._record_call(
+        result = self._record_call_with_retries(
             stage="inspect",
             method="inspect",
             namespace=namespace,
             operation_id=None,
             input_payload={"memory_ids": list(memory_ids)},
             fn=lambda: self.adapter.inspect(namespace, memory_ids),
+            attempts=ctx.attempts,
+            entries=ctx.entries,
+            retryable=lambda error: error.transient,
+            attempt_kind=ctx.attempt_kind,
         )
-        ctx.attempts.append(attempt)
-        ctx.entries.append(entry)
-        if error is not None:
-            raise _StageFailure("inspect", error)
         assert result is not None
         returned = {state.memory_id: state for state in result}
         for mid in memory_ids:
@@ -751,6 +799,7 @@ class OperationsRunner(RunnerBase):
             attempts=ctx.attempts,
             entries=ctx.entries,
             stage_states=ctx.stage_states,
+            attempt_kind=ctx.attempt_kind,
         )
         self._close(ctx, ns)
 
@@ -880,6 +929,7 @@ class OperationsRunner(RunnerBase):
             attempts=ctx.attempts,
             entries=ctx.entries,
             stage_states=ctx.stage_states,
+            attempt_kind=ctx.attempt_kind,
         )
         self._assert_absent_and_unrelated(ctx, ns, "after delete")
         self._close(ctx, ns)

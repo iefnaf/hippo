@@ -128,13 +128,21 @@ class JudgeCallRecord:
 
 @dataclass(frozen=True)
 class SampleScoring:
-    """Scorer output for one sample; metrics always registry ids."""
+    """Scorer output for one sample; metrics always registry ids.
+
+    judge_attempts carries EVERY judge call attempt in order (bounded
+    transient retries included); judge_call exposes the final one.
+    """
 
     metrics: list[MetricResult]
     correct: bool | None
     attribution: str | None
     trace: ScoringTraceArtifact
-    judge_call: JudgeCallRecord | None
+    judge_attempts: tuple[JudgeCallRecord, ...] = ()
+
+    @property
+    def judge_call(self) -> JudgeCallRecord | None:
+        return self.judge_attempts[-1] if self.judge_attempts else None
 
 
 class QAScorer:
@@ -150,6 +158,9 @@ class QAScorer:
         protocol_id: str,
         clock: Callable[[], str] = now_utc,
         monotonic: Callable[[], float] = time.perf_counter,
+        max_retries: int = 0,
+        backoff_base_s: float = 1.0,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._dataset = dataset
         self._judge = judge
@@ -158,6 +169,13 @@ class QAScorer:
         self._protocol_id = protocol_id
         self._clock = clock
         self._monotonic = monotonic
+        self._max_retries = max_retries
+        self._backoff_base_s = backoff_base_s
+        self._sleep = sleep
+
+    def _backoff_seconds(self, retry_index: int) -> float:
+        """1s/4s/16s-shaped deterministic backoff (base * 4**k)."""
+        return self._backoff_base_s * (4**retry_index)
 
     # -- private scoring view ----------------------------------------------
 
@@ -313,11 +331,14 @@ class QAScorer:
 
         correct: bool | None = None
         attribution: str | None = None
-        judge_call: JudgeCallRecord | None = None
+        judge_attempts: tuple[JudgeCallRecord, ...] = ()
         if reader_result is not None:
-            judge_call = self._judge_call(handle, scoring, question, reader_result)
-            if judge_call.result is not None:
-                correct = judge_call.result.correct
+            judge_attempts = self._judge_attempts(
+                handle, scoring, question, reader_result
+            )
+            final = judge_attempts[-1]
+            if final.result is not None:
+                correct = final.result.correct
                 attribution = attribution_cell(correct, hit)
 
         trace = ScoringTraceArtifact(
@@ -339,10 +360,39 @@ class QAScorer:
             correct=correct,
             attribution=attribution,
             trace=trace,
-            judge_call=judge_call,
+            judge_attempts=judge_attempts,
         )
 
-    def _judge_call(
+    def _judge_attempts(
+        self,
+        handle: str,
+        scoring: ScoringData,
+        question: QueryContext,
+        reader_result: ReaderResult,
+    ) -> tuple[JudgeCallRecord, ...]:
+        """Bounded transient retries around the judge call.
+
+        Only TRANSIENT errors retry (temporary API failures); an
+        unparseable verdict is a protocol failure that fails the judge
+        stage instead of being retried into a fabricated verdict, and a
+        low score is never a retry reason.
+        """
+        records: list[JudgeCallRecord] = []
+        retries = 0
+        while True:
+            record = self._single_judge_attempt(
+                handle, scoring, question, reader_result
+            )
+            records.append(record)
+            if record.error is None or not record.error.transient:
+                break
+            if retries >= self._max_retries:
+                break
+            self._sleep(self._backoff_seconds(retries))
+            retries += 1
+        return tuple(records)
+
+    def _single_judge_attempt(
         self,
         handle: str,
         scoring: ScoringData,
