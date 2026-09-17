@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "run_id": "run-fixture-0003",
+  "sample_handle": "smoke_multi_session_0001",
+  "stage": "retrieve",
+  "evidence": [
+    {
+      "kind": "extractive",
+      "text": "项目使用 pnpm。",
+      "extractive_span": {
+        "session_id": "s_6f2c",
+        "msg_id": "m_91ab",
+        "start": 0,
+        "end": 8
+      },
+      "derivation_sources": [
+        {"session_id": "s_6f2c", "msg_id": "m_91ab"}
+      ],
+      "source_times": ["2026-09-03"],
+      "retrieval_score": null
+    }
+  ]
+}

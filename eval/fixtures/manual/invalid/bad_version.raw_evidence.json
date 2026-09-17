@@ -1,0 +1,7 @@
+{
+  "schema_version": 2,
+  "run_id": "run-fixture-0004",
+  "sample_handle": "smoke_multi_session_0001",
+  "stage": "retrieve",
+  "evidence": []
+}

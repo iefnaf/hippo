@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "kind": "mutation_receipt",
+  "payload": {
+    "operation_id": "op-0001",
+    "status": "failed",
+    "memory_ids": [],
+    "sources": [],
+    "error": {
+      "code": "backend_down",
+      "message": "connection lost after commit",
+      "effect": "maybe",
+      "transient": true
+    },
+    "usage": null
+  }
+}

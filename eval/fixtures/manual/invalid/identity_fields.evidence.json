@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "kind": "evidence",
+  "payload": {
+    "kind": "extractive",
+    "text": "项目使用 pnpm。",
+    "extractive_span": {
+      "session_id": "s_6f2c",
+      "msg_id": "m_91ab",
+      "start": 0,
+      "end": 8
+    },
+    "derivation_sources": [],
+    "source_times": ["2026-09-03"],
+    "retrieval_score": null,
+    "memory_id": "mem_123",
+    "validity": "current"
+  }
+}

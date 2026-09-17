@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "result": {
+    "run_id": "run-fixture-0005",
+    "sample_handle": "smoke_multi_session_0001",
+    "namespace": "ns_b1d2e3f4",
+    "config_fingerprint": "3f1a9c8e77b24d05af6c2b91e0d4f8a3c5b7e9d1f0a2c4e6b8d0f2a4c6e8b0d2",
+    "suite": "qa",
+    "qa_status": "scored",
+    "operation_status": null,
+    "correct": false,
+    "attribution": "hit_wrong",
+    "failed_stage": null,
+    "metrics": [
+      {
+        "metric_id": "macro_f1",
+        "status": "computed",
+        "value": 0.42,
+        "reason": null
+      }
+    ],
+    "stage_states": {
+      "retrieve": "completed",
+      "read": "completed",
+      "judge": "completed"
+    },
+    "artifact_refs": {},
+    "attempts": []
+  }
+}

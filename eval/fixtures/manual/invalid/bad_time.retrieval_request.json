@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "kind": "retrieval_request",
+  "payload": {
+    "query": "这个项目现在使用什么包管理器？",
+    "question_date": "2026/09/06",
+    "evidence_token_budget": 4096
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "kind": "session",
+  "payload": {
+    "session_id": "s_6f2c",
+    "occurred_at": "2026-09-03",
+    "messages": [
+      {
+        "msg_id": "m_91ab",
+        "role": "user",
+        "content": "迁移到 pnpm，以后都用 pnpm。"
+      }
+    ]
+  }
+}

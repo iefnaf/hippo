@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "result": {
+    "run_id": "run-fixture-0001",
+    "sample_handle": "smoke_knowledge_update_0001",
+    "namespace": "ns_a7f3c9d2",
+    "config_fingerprint": "3f1a9c8e77b24d05af6c2b91e0d4f8a3c5b7e9d1f0a2c4e6b8d0f2a4c6e8b0d2",
+    "suite": "qa",
+    "qa_status": "scored",
+    "operation_status": null,
+    "correct": true,
+    "attribution": "hit_correct",
+    "failed_stage": null,
+    "metrics": [
+      {
+        "metric_id": "budgeted_session_recall",
+        "status": "computed",
+        "value": 1.0,
+        "reason": null
+      },
+      {
+        "metric_id": "recall_at_1",
+        "status": "computed",
+        "value": 1.0,
+        "reason": null
+      },
+      {
+        "metric_id": "scored_accuracy",
+        "status": "not_applicable",
+        "value": null,
+        "reason": "per-sample diagnostic; aggregate only"
+      }
+    ],
+    "stage_states": {
+      "ingest": "completed",
+      "await_ready": "completed",
+      "retrieve": "completed",
+      "prepare": "completed",
+      "read": "completed",
+      "judge": "completed"
+    },
+    "artifact_refs": {
+      "raw_evidence": "artifacts/run-fixture-0001/smoke_knowledge_update_0001/raw_evidence.json",
+      "prepared_evidence": "artifacts/run-fixture-0001/smoke_knowledge_update_0001/prepared_evidence.json",
+      "reader_result": "artifacts/run-fixture-0001/smoke_knowledge_update_0001/reader_result.json",
+      "judge_record": "artifacts/run-fixture-0001/smoke_knowledge_update_0001/judge_record.json"
+    },
+    "attempts": [
+      {
+        "attempt_id": "att-0001",
+        "stage": "retrieve",
+        "operation_id": null,
+        "outcome": "returned",
+        "started_at": "2026-09-06T00:00:00.000000Z",
+        "ended_at": "2026-09-06T00:00:01.250000Z",
+        "elapsed_ms": 1250.0,
+        "input_ref": "artifacts/run-fixture-0001/smoke_knowledge_update_0001/retrieve_input.json",
+        "output_ref": "artifacts/run-fixture-0001/smoke_knowledge_update_0001/raw_evidence.json",
+        "error": null,
+        "usage": null
+      }
+    ]
+  }
+}
