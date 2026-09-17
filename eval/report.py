@@ -172,6 +172,128 @@ class Reporter:
     # -- build --------------------------------------------------------------
 
     def build(self) -> SummaryReport:
+        if self.manifest.get("suite") == "operations":
+            return self._build_operations_report()
+        return self._build_qa_report()
+
+    # -- operations suite ----------------------------------------------------
+
+    def _build_operations_report(self) -> SummaryReport:
+        """Suite-dispatched report for operations runs (issue #4 leftover).
+
+        Operations run directories were previously forced through the
+        qa-shaped renderer; they now render their own shape from the
+        persisted operations summary: per-check status table, separate
+        passed/failed/not_supported/pending counts and the two
+        registered operations metrics.
+        """
+        import json as _json
+
+        summary_path = self.run_dir / "operations_summary.json"
+        if not summary_path.exists():
+            raise ReportError(
+                f"operations run directory {self.run_dir} has no "
+                "operations_summary.json; re-run or resume it first"
+            )
+        summary = _json.loads(summary_path.read_text(encoding="utf-8"))
+        config = self.config_doc["config"]
+        header = {
+            "run_id": self.manifest["run_id"],
+            "command": self.manifest.get("command", "run"),
+            "created_at": self.manifest["created_at"],
+            "config_name": self.manifest["config_name"],
+            "config_fingerprint": self.manifest["config_fingerprint"],
+            "dataset_plan": self.manifest["dataset_plan"],
+            "sample_plan_id": self.manifest["sample_plan_id"],
+            "suite": "operations",
+            "evidence_token_budget": self.manifest["evidence_token_budget"],
+            "memory_name": config["memory"]["name"],
+            "memory_baseline_kind": config["memory"]["baseline_kind"],
+            "metrics_registry_version": self.manifest["metrics_registry_version"],
+            "metrics_registry_content_version": REGISTRY_CONTENT_VERSION,
+        }
+        statuses = {
+            "planned": summary["planned_checks"],
+            "passed": summary["passed"],
+            "failed": summary["failed"],
+            "not_supported": summary["not_supported"],
+            "pending": summary["pending"],
+        }
+        metrics: list[MetricAggregate] = []
+        denominator = summary["passed"] + summary["failed"]
+        if denominator:
+            metrics.append(
+                MetricAggregate(
+                    metric_id="operations_pass_rate",
+                    status="computed",
+                    value=_round(summary["pass_rate"]),
+                    denominator=f"passed+failed={denominator}",
+                    reason=None,
+                )
+            )
+        else:
+            metrics.append(
+                MetricAggregate(
+                    metric_id="operations_pass_rate",
+                    status="not_applicable",
+                    value=None,
+                    denominator="",
+                    reason="denominator_zero：没有任何已执行（passed/failed）的检查",
+                )
+            )
+        if summary["planned_checks"]:
+            metrics.append(
+                MetricAggregate(
+                    metric_id="operations_support_coverage",
+                    status="computed",
+                    value=_round(summary["support_coverage"]),
+                    denominator=f"计划检查={summary['planned_checks']}",
+                    reason=None,
+                )
+            )
+        for metric in metrics:
+            get_metric(metric["metric_id"])  # registry guard
+        checks = [
+            {
+                "check_id": check["check_id"],
+                "status": check["operation_status"],
+                "namespaces": list(check["namespaces"]),
+                "target_memory_ids": list(check["target_memory_ids"]),
+                "missing_capabilities": list(check["missing_capabilities"]),
+                "failed_stage": check["failed_stage"],
+                "reason": check["reason"],
+                "assertions": [
+                    {
+                        "name": a["name"],
+                        "passed": a["passed"],
+                        "expected": a["expected"],
+                        "observed": a["observed"],
+                    }
+                    for a in check["assertions"]
+                ],
+            }
+            for check in summary["checks"]
+        ]
+        limitations = [
+            "M1 操作检查为 fake 路径的程序化断言，不代表任何 memory 实现的性能。",
+            "通过率分母为 passed+failed；not_supported 不进分母也不被隐藏。",
+            "正式指标全部来自指标注册表。",
+        ]
+        if summary["pending"]:
+            limitations.insert(
+                0,
+                "本次运行存在未到终态（pending）的检查：报告仅为中间进度。",
+            )
+        return SummaryReport(
+            schema_version=1,
+            header=header,
+            statuses=statuses,
+            metrics=metrics,
+            checks=checks,
+            limitations=limitations,
+        )
+
+    def _build_qa_report(self) -> SummaryReport:
         results = self._load_results()
         traces: dict[str, ScoringTraceArtifact | None] = {}
         prepared: dict[str, PreparedEvidenceArtifact | None] = {}
@@ -894,6 +1016,99 @@ def _table(headers: list[str], rows: list[list[str]]) -> str:
 
 
 def render_markdown(report: SummaryReport) -> str:
+    if report["header"].get("suite") == "operations":
+        return _render_markdown_operations(report)
+    return _render_markdown_qa(report)
+
+
+def _render_markdown_operations(report: SummaryReport) -> str:
+    header = report["header"]
+    statuses = report["statuses"]
+    lines: list[str] = []
+    lines.append("# Memory Eval 操作能力套件报告")
+    lines.append("")
+    lines.append(
+        _table(
+            ["字段", "值"],
+            [
+                ["run ID", header["run_id"]],
+                ["配置", f"{header['config_name']}（指纹 {header['config_fingerprint'][:12]}…）"],
+                ["数据计划", f"{header['dataset_plan']} / {header['sample_plan_id']}"],
+                ["memory", f"{header['memory_name']}（{header['memory_baseline_kind']}）"],
+                ["指标注册表", f"v{header['metrics_registry_version']}（{header['metrics_registry_content_version']}）"],
+            ],
+        )
+    )
+    lines.append("")
+    lines.append("## 状态计数")
+    lines.append("")
+    lines.append(
+        _table(
+            ["口径", "数量", "说明"],
+            [
+                ["计划检查", str(statuses["planned"]), "运行前固定的检查清单"],
+                ["passed", str(statuses["passed"]), "确定性断言全部通过"],
+                ["failed", str(statuses["failed"]), "断言失败或声明能力但无法给出明确状态"],
+                ["not_supported", str(statuses["not_supported"]), "未声明所需能力；不进通过率分母"],
+                ["pending", str(statuses["pending"]), "未到终态（中间进度）"],
+            ],
+        )
+    )
+    lines.append("")
+    lines.append(f"## 正式指标（指标注册表 v{header['metrics_registry_version']}）")
+    lines.append("")
+    lines.append(
+        _table(
+            ["metric_id", "状态", "数值", "分母 / 说明"],
+            [
+                [
+                    m["metric_id"],
+                    "computed" if m["status"] == "computed" else "N/A",
+                    _fmt(m["value"]) if m["status"] == "computed" else "—",
+                    m["reason"] or m["denominator"],
+                ]
+                for m in report["metrics"]
+            ],
+        )
+    )
+    lines.append("")
+    lines.append("## 逐项检查")
+    lines.append("")
+    checks = report.get("checks", [])
+    lines.append(
+        _table(
+            ["检查", "状态", "断言数", "缺失能力", "失败阶段", "原因"],
+            [
+                [
+                    c["check_id"],
+                    c["status"],
+                    str(len(c["assertions"])),
+                    ", ".join(c["missing_capabilities"]) or "—",
+                    c["failed_stage"] or "—",
+                    (c["reason"] or "—")[:60],
+                ]
+                for c in checks
+            ],
+        )
+    )
+    lines.append("")
+    lines.append("断言明细（程序化断言，不经 LLM judge）：")
+    lines.append("")
+    for check in checks:
+        lines.append(f"- **{check['check_id']}**（{check['status']}）")
+        for a in check["assertions"]:
+            mark = "✓" if a["passed"] else "✗"
+            lines.append(f"  - {mark} {a['name']}: 期望 {a['expected']}，实际 {a['observed']}")
+    lines.append("")
+    lines.append("## 限制")
+    lines.append("")
+    for note in report["limitations"]:
+        lines.append(f"- {note}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _render_markdown_qa(report: SummaryReport) -> str:
     header = report["header"]
     statuses = report["statuses"]
     lines: list[str] = []

@@ -777,3 +777,68 @@ class TestCliOperationsRun:
         assert code == 0
         payload = json.loads(capsys.readouterr().out)
         assert "not-executed" in payload["status"]
+
+    def test_cli_report_renders_operations_shape(self, capsys, tmp_path: Path):
+        """Issue #4 leftover: report dispatches by suite, not qa shape."""
+        from eval.cli import main
+
+        out = tmp_path / "runs"
+        code = main(
+            ["run", "--config", OPS_EXAMPLE_CONFIG, "--out", str(out)]
+        )
+        assert code == 0
+        run_dir = Path(json.loads(capsys.readouterr().out)["run_dir"])
+        code = main(["report", "--run", str(run_dir)])
+        assert code == 0
+        markdown = capsys.readouterr().out
+        assert "操作能力套件报告" in markdown
+        assert "operations_pass_rate" in markdown
+        assert "operations_support_coverage" in markdown
+        assert "not_supported" in markdown
+        # Every planned check is listed with its own status row.
+        for check_id in ("auto_update", "explicit_update", "delete", "isolation", "persistence"):
+            assert check_id in markdown
+        # qa-shaped sections must not appear for an operations run.
+        assert "检索 × 问答 2×2 联合归因" not in markdown
+        assert "证据预算构成" not in markdown
+
+    def test_reporter_build_operations_report_payload(self, capsys, tmp_path: Path):
+        from eval.cli import main
+        from eval.report import Reporter
+
+        out = tmp_path / "runs"
+        code = main(
+            ["run", "--config", OPS_EXAMPLE_CONFIG, "--out", str(out)]
+        )
+        assert code == 0
+        run_dir = Path(json.loads(capsys.readouterr().out)["run_dir"])
+        report = Reporter(run_dir).build()
+        assert report["header"]["suite"] == "operations"
+        assert report["statuses"] == {
+            "planned": 5,
+            "passed": 5,
+            "failed": 0,
+            "not_supported": 0,
+            "pending": 0,
+        }
+        assert [m["metric_id"] for m in report["metrics"]] == [
+            "operations_pass_rate",
+            "operations_support_coverage",
+        ]
+        assert report["metrics"][0]["value"] == 1.0
+        assert report["metrics"][1]["value"] == 1.0
+        assert {c["check_id"] for c in report["checks"]} == {
+            "auto_update",
+            "explicit_update",
+            "delete",
+            "isolation",
+            "persistence",
+        }
+        # Assertions are programmatic and recorded per check.
+        explicit = next(c for c in report["checks"] if c["check_id"] == "explicit_update")
+        assert explicit["assertions"]
+        assert all(a["passed"] for a in explicit["assertions"])
+        assert all(a["expected"] and a["observed"] is not None for a in explicit["assertions"])
+        # Explicit update assertions cover the completion contract.
+        names = " ".join(a["name"] for a in explicit["assertions"])
+        assert "inspect" in names or "content" in names or "validity" in names
