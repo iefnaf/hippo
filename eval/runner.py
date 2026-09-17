@@ -1,4 +1,5 @@
-"""Offline single-question loop: ingest -> reopen -> retrieve -> prepare.
+"""Offline single-question loop: ingest -> reopen -> retrieve -> prepare
+-> read -> score/judge -> report.
 
 The M1 runner drives one isolated space per sample through the protocol
 fixed in the design document:
@@ -10,13 +11,22 @@ fixed in the design document:
    the dataset question_date and the fixed token budget (machine time
    never enters query context), retrieve, then run reader input
    preparation against the cleaned history;
-3. persistence: per-sample artifacts (attempt log, pre-truncation raw
-   evidence, post-budget prepared evidence) and one Result JSONL line
-   with stage states, call attempts, timing and usage.
+3. answer phase: the fixed reader answers from the exact PreparedEvidence
+   the harness retained (never gold, never the private ID mapping);
+4. scoring: the scorer computes verifiable recall from that same
+   prepared evidence (private ScoringData view only it reads) and asks
+   the judge through the protocol adapter; abstention samples keep
+   recall N/A but still receive verdicts; invalid scoring data marks the
+   sample invalid_input instead of silently excluding it;
+5. persistence: per-sample artifacts (attempt log, raw evidence,
+   prepared evidence, reader result, judge record, scoring trace) and one
+   Result JSONL line per sample; after every planned sample reached a
+   terminal state the Reporter writes report.json / report.md.
 
-Reader/judge stages stay pending in this milestone (M1 辅助问答 lands in
-a later issue); a failed ingest/retrieve/prepare marks the sample
-failed with its failed_stage while its artifacts are still persisted.
+Reader or judge failures never erase retrieval results: recall metrics
+survive in the Result while qa_status records the failed stage. Ingest,
+retrieve and prepare failures still score recall with an empty retained
+set (zero, not excluded) per the design's denominator rules.
 """
 
 from __future__ import annotations
@@ -28,24 +38,29 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from eval.contracts.adapter import ErrorInfo, Evidence, MutationReceipt
+from eval.contracts.adapter import ErrorInfo, Evidence, MutationReceipt, ResourceUsage
 from eval.contracts.common import ContractError, now_utc
 from eval.contracts.internal import (
+    JudgeRecordArtifact,
     PreparedEvidence,
     PreparedEvidenceArtifact,
     RawEvidenceArtifact,
+    ReaderResult,
+    ReaderResultArtifact,
     Result,
     ResultArtifact,
     StageAttempt,
 )
+from eval.judges.base import Judge
 from eval.memories.base import MemoryAdapter, MemoryAdapterError
-from eval.memories.usage import recorded_usage
+from eval.memories.usage import merge_resource_usage, recorded_usage
 from eval.prepare.evidence import (
     HistoryIndex,
     PrepareError,
     build_history_index,
     prepare_evidence,
 )
+from eval.readers.base import Reader, ReaderError
 from eval.runs import (
     AttemptEntry,
     AttemptLogArtifact,
@@ -55,8 +70,9 @@ from eval.runs import (
     inline_ref,
 )
 from eval.prepare.tokens import TestCharTokenizer
+from eval.scorers.qa import QAScorer, SampleScoring, ScoringDataError
 
-QueryStages = ("ingest", "await_ready", "retrieve", "prepare")
+QueryStages = ("ingest", "await_ready", "retrieve", "prepare", "read", "score", "judge")
 
 
 class _StageFailure(Exception):
@@ -88,19 +104,22 @@ class RunOutcome:
     run_dir: Path
     results: list[ResultArtifact] = field(default_factory=list)
     failed: int = 0
+    invalid_input: int = 0
+    scored: int = 0
+    report_refs: dict[str, str] = field(default_factory=dict)
 
     def summary(self) -> dict[str, Any]:
-        completed = sum(
-            1
-            for r in self.results
-            if r.result.stage_states.get("prepare") == "completed"
-        )
         return {
             "run_id": self.run_id,
             "run_dir": str(self.run_dir),
             "samples": len(self.results),
-            "prepare_completed": completed,
+            "scored": self.scored,
             "failed": self.failed,
+            "invalid_input": self.invalid_input,
+            "pending": sum(
+                1 for r in self.results if r.result.qa_status == "pending"
+            ),
+            "report": dict(self.report_refs),
         }
 
 
@@ -114,6 +133,17 @@ def _operation_id(run_id: str, namespace: str, stage: str, seq: int, payload: An
     return f"{run_id}:{namespace}:{stage}:{seq:03d}:{digest}"
 
 
+def _reader_error_transform(exc: Exception) -> ErrorInfo:
+    if isinstance(exc, ReaderError):
+        return exc.to_error_info()
+    return ErrorInfo(
+        code="reader_exception",
+        message=f"{type(exc).__name__}: {exc}",
+        effect="none",
+        transient=True,
+    )
+
+
 class OfflineRunner:
     """Runs the offline loop for every configured sample."""
 
@@ -123,6 +153,8 @@ class OfflineRunner:
         config: Any,
         dataset: Any,
         adapter: MemoryAdapter,
+        reader: Reader,
+        judge: Judge,
         store: RunStore,
         run_id: str,
         clock: Callable[[], str] = now_utc,
@@ -131,11 +163,22 @@ class OfflineRunner:
         self.config = config
         self.dataset = dataset
         self.adapter = adapter
+        self.reader = reader
         self.store = store
         self.run_id = run_id
         self._clock = clock
         self._monotonic = monotonic
         self._attempt_seq = 0
+        self._scorer = QAScorer(
+            dataset=dataset,
+            judge=judge,
+            extractive_declared="extractive_evidence"
+            in set(config.memory.capabilities),
+            baseline_kind=config.memory.baseline_kind,
+            protocol_id=config.judge.protocol_id,
+            clock=clock,
+            monotonic=monotonic,
+        )
 
     # -- pre-run checks ----------------------------------------------------
 
@@ -165,6 +208,8 @@ class OfflineRunner:
                 open_calls=n_sessions + 1,
                 close_calls=n_sessions + 1,
                 retrieve_calls=1,
+                reader_calls=1,
+                judge_calls=1,
             )
         return counts
 
@@ -203,6 +248,18 @@ class OfflineRunner:
             outcome.results.append(artifact)
             if artifact.result.qa_status == "failed":
                 outcome.failed += 1
+            elif artifact.result.qa_status == "invalid_input":
+                outcome.invalid_input += 1
+            elif artifact.result.qa_status == "scored":
+                outcome.scored += 1
+        from eval.report import Reporter, render_markdown
+
+        reporter = Reporter(self.store.dir)
+        report = reporter.build()
+        outcome.report_refs = self.store.write_report(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            render_markdown(report),
+        )
         return outcome
 
     # -- attempt recording -------------------------------------------------
@@ -221,6 +278,7 @@ class OfflineRunner:
         input_payload: dict[str, Any],
         fn: Callable[[], Any],
         error_transform: Callable[[Exception], ErrorInfo] | None = None,
+        usage_from: Callable[[Any], ResourceUsage | None] | None = None,
     ) -> tuple[Any | None, StageAttempt, AttemptEntry, ErrorInfo | None]:
         attempt_id = self._next_attempt_id(stage)
         started_at = self._clock()
@@ -247,6 +305,14 @@ class OfflineRunner:
         elapsed_ms = round((self._monotonic() - t0) * 1000.0, 3)
         ended_at = self._clock()
         usage = recorder.merged()
+        if error is None and usage_from is not None and result is not None:
+            reported = usage_from(result)
+            if reported is not None:
+                usage = (
+                    reported
+                    if usage is None
+                    else merge_resource_usage([usage, reported])
+                )
         outcome = "error" if error is not None else "returned"
         output_json = None if error is not None else _jsonable(result)
         stage_attempt = StageAttempt(
@@ -335,8 +401,11 @@ class OfflineRunner:
         entries: list[AttemptEntry] = []
         failed_stage: str | None = None
         failure: ErrorInfo | None = None
+        invalid_input = False
         raw_evidence: list[Evidence] | None = None
         prepared: PreparedEvidence | None = None
+        reader_result: ReaderResult | None = None
+        scoring: SampleScoring | None = None
         sessions = self.dataset.iter_sessions(handle)
 
         self._record_lifecycle("reset", namespace, lambda: self.adapter.reset(namespace))
@@ -441,13 +510,133 @@ class OfflineRunner:
             failed_stage = exc.stage
             failure = exc.error
             stage_states[exc.stage] = "failed"
+
+        try:
+            # Answer phase: the reader consumes the exact retained evidence.
+            question = self.dataset.get_question(handle)
+            if failed_stage is None and prepared is not None:
+                reader_result, attempt, entry, error = self._record_call(
+                    stage="read",
+                    method="reader.answer",
+                    namespace=namespace,
+                    operation_id=None,
+                    input_payload={
+                        "question": question.model_dump(mode="json"),
+                        "prepared_token_count": prepared.token_count,
+                        "prepared_units": len(prepared.items),
+                        "tokenizer_id": prepared.tokenizer_id,
+                    },
+                    fn=lambda: self.reader.answer(question, prepared),
+                    error_transform=_reader_error_transform,
+                    usage_from=lambda r: r.usage,
+                )
+                attempts.append(attempt)
+                entries.append(entry)
+                if error is not None:
+                    failed_stage = "read"
+                    failure = error
+                    stage_states["read"] = "failed"
+                    reader_result = None
+                else:
+                    assert reader_result is not None
+                    stage_states["read"] = "completed"
+
+            # Scoring: recall from the same prepared evidence + judge
+            # verdict. Runs even after ingest/retrieve/prepare/read
+            # failures: recall is computed with an empty retained set
+            # (zero), and verdicts are only attempted when a reader
+            # answer exists.
+            try:
+                scoring = self._scorer.score_sample(
+                    run_id=self.run_id,
+                    handle=handle,
+                    question=question,
+                    prepared=prepared,
+                    reader_result=reader_result,
+                )
+                stage_states["score"] = "completed"
+            except ScoringDataError as exc:
+                invalid_input = True
+                failed_stage = "score"
+                failure = ErrorInfo(
+                    code=exc.code,
+                    message=exc.message,
+                    effect="none",
+                    transient=False,
+                )
+                stage_states["score"] = "failed"
+                scoring = None
+                self._lifecycle_entries.append(
+                    AttemptEntry(
+                        attempt_id=self._next_attempt_id("score"),
+                        stage="score",
+                        method="dataset.get_scoring_data",
+                        namespace=namespace,
+                        operation_id=None,
+                        started_at=self._clock(),
+                        ended_at=self._clock(),
+                        elapsed_ms=0.0,
+                        input={"sample_handle": handle},
+                        output=None,
+                        error=failure,
+                        usage=None,
+                    )
+                )
+
+            if scoring is not None and scoring.judge_call is not None:
+                call = scoring.judge_call
+                attempt_id = self._next_attempt_id("judge")
+                attempts.append(
+                    StageAttempt(
+                        attempt_id=attempt_id,
+                        stage="judge",
+                        operation_id=None,
+                        outcome="error" if call.error is not None else "returned",
+                        started_at=call.started_at,
+                        ended_at=call.ended_at,
+                        elapsed_ms=call.elapsed_ms,
+                        input_ref=inline_ref(call.request.model_dump(mode="json")),
+                        output_ref=(
+                            None
+                            if call.error is not None
+                            else inline_ref(call.result.model_dump(mode="json"))
+                        ),
+                        error=call.error,
+                        usage=call.usage,
+                    )
+                )
+                entries.append(
+                    AttemptEntry(
+                        attempt_id=attempt_id,
+                        stage="judge",
+                        method="judge.evaluate",
+                        namespace=namespace,
+                        operation_id=None,
+                        started_at=call.started_at,
+                        ended_at=call.ended_at,
+                        elapsed_ms=call.elapsed_ms,
+                        input={"request": call.request.model_dump(mode="json")},
+                        output=(
+                            None
+                            if call.error is not None
+                            else call.result.model_dump(mode="json")
+                        ),
+                        error=call.error,
+                        usage=call.usage,
+                    )
+                )
+                if call.error is not None:
+                    failed_stage = "judge"
+                    failure = call.error
+                    stage_states["judge"] = "failed"
+                else:
+                    stage_states["judge"] = "completed"
         finally:
             # Best-effort close; lifecycle failures land in the log only.
             self._record_lifecycle(
                 "close", namespace, lambda: self.adapter.close(namespace)
             )
-
-        entries = self._lifecycle_entries + entries
+            entries = self._lifecycle_entries + entries
 
         log_artifact = AttemptLogArtifact(
             run_id=self.run_id,
@@ -473,28 +662,68 @@ class OfflineRunner:
             if prepared is not None
             else None
         )
+        reader_artifact = (
+            ReaderResultArtifact(
+                run_id=self.run_id,
+                sample_handle=handle,
+                result=reader_result,
+            )
+            if reader_result is not None
+            else None
+        )
+        judge_artifact = (
+            JudgeRecordArtifact(
+                run_id=self.run_id,
+                sample_handle=handle,
+                request=scoring.judge_call.request,
+                result=scoring.judge_call.result,
+            )
+            if scoring is not None
+            and scoring.judge_call is not None
+            and scoring.judge_call.result is not None
+            else None
+        )
         refs = self.store.write_sample_artifacts(
             handle,
             attempts_log=log_artifact,
             raw_evidence=raw_artifact,
             prepared_evidence=prepared_artifact,
+            reader_result=reader_artifact,
+            judge_record=judge_artifact,
+            scoring_trace=(
+                scoring.trace if scoring is not None else None
+            ),
         )
+
+        metrics = scoring.metrics if scoring is not None else []
+        if failed_stage is None:
+            assert scoring is not None and scoring.correct is not None
+            qa_status = "scored"
+            correct: bool | None = scoring.correct
+            attribution = scoring.attribution
+        else:
+            qa_status = "invalid_input" if invalid_input else "failed"
+            correct = None
+            attribution = None
         result = Result(
             run_id=self.run_id,
             sample_handle=handle,
             namespace=namespace,
             config_fingerprint=self.config.fingerprint(),
             suite="qa",
-            qa_status="failed" if failed_stage is not None else "pending",
+            qa_status=qa_status,  # type: ignore[arg-type]
             operation_status=None,
-            correct=None,
-            attribution=None,
+            correct=correct,
+            attribution=attribution,  # type: ignore[arg-type]
             failed_stage=failed_stage,
-            metrics=[],
+            metrics=metrics,
             stage_states=stage_states,
             artifact_refs=refs,
             attempts=attempts,
         )
+        from eval.metrics import validate_result_metrics
+
+        validate_result_metrics(result)
         artifact = ResultArtifact(result=result)
         self.store.append_result(artifact)
         return artifact

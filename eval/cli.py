@@ -53,7 +53,9 @@ def _load_config_or_exit(path: str) -> ExperimentConfig:
 def _execute_offline_run(config: ExperimentConfig, args: argparse.Namespace) -> int:
     from eval.contracts.common import now_utc
     from eval.datasets.manual import DEFAULT_DATASET_PATH, ManualDataset
+    from eval.judges.fake import build_fake_judge
     from eval.memories.fake import build_fake_adapter
+    from eval.readers.fake import build_fake_reader
     from eval.runner import OfflineRunner
     from eval.runs import RunStore, new_run_id
 
@@ -69,6 +71,8 @@ def _execute_offline_run(config: ExperimentConfig, args: argparse.Namespace) -> 
         config=config,
         dataset=dataset,
         adapter=adapter,
+        reader=build_fake_reader(config.reader),
+        judge=build_fake_judge(config.judge),
         store=store,
         run_id=run_id,
     )
@@ -77,6 +81,21 @@ def _execute_offline_run(config: ExperimentConfig, args: argparse.Namespace) -> 
     except ContractError as exc:
         _print_contract_error(exc)
         return 2
+    from eval.report import Reporter
+
+    report = Reporter(outcome.run_dir).build()
+    headline = {
+        m["metric_id"]: m["value"] if m["status"] == "computed" else None
+        for m in report["metrics"]
+        if m["metric_id"]
+        in (
+            "planned_question_score",
+            "scored_accuracy",
+            "verifiable_session_recall_macro",
+            "verifiable_session_recall_micro",
+            "recall_at_1",
+        )
+    }
     payload = {
         "command": "run",
         "run_id": outcome.run_id,
@@ -87,10 +106,11 @@ def _execute_offline_run(config: ExperimentConfig, args: argparse.Namespace) -> 
             "metrics_registry_version"
         ],
         "sample_count": len(outcome.results),
+        "headline_metrics": headline,
         **outcome.summary(),
     }
     print(json.dumps(payload, indent=2, ensure_ascii=False))
-    return 0 if outcome.failed == 0 else 1
+    return 0 if outcome.failed == 0 and outcome.invalid_input == 0 else 1
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -106,10 +126,22 @@ def cmd_run(args: argparse.Namespace) -> int:
         ],
         "sample_count": len(config.sample_ids),
         "status": "not-executed (pass --out DIR to execute the offline M1 "
-        "loop: per-session ingest -> reopen -> retrieve -> prepare; fake "
-        "components only, no external model)",
+        "loop: per-session ingest -> reopen -> retrieve -> prepare -> read "
+        "-> score/judge -> report; fake components only, no external model)",
     }
     print(json.dumps(plan, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    from eval.report import Reporter, render_markdown
+
+    try:
+        report = Reporter(args.run).build()
+    except (ContractError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(render_markdown(report))
     return 0
 
 
@@ -187,6 +219,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="manual dataset fixture (default: the bundled smoke samples)",
     )
     p_run.set_defaults(func=cmd_run)
+
+    p_report = sub.add_parser(
+        "report",
+        help="rebuild and print the summary report of an existing run",
+    )
+    p_report.add_argument("--run", required=True, metavar="DIR")
+    p_report.set_defaults(func=cmd_report)
 
     p_resume = sub.add_parser("resume", help="resume a run from checkpoints (M2)")
     p_resume.add_argument("--config", required=True)

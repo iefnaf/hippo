@@ -7,8 +7,12 @@ Every run produces a directory:
       config.json           immutable ConfigArtifact snapshot
       samples.jsonl         one ResultArtifact per sample (stage states,
                             attempts with timing and usage, artifact refs)
+      report.json/.md       run summary (statuses, registered metrics,
+                            2x2 attribution, budget composition, cost model)
       artifacts/<handle>/   attempts.json, raw_evidence.json (pre-truncation
-                            diagnostic), prepared_evidence.json (post-budget)
+                            diagnostic), prepared_evidence.json (post-budget),
+                            reader_result.json, judge_record.json (private:
+                            carries gold), scoring.json (private trace)
 
 Artifact references are checksummed strings 'sha256:<hex>:<relative
 path>'; inline values (receipts, prepared objects) are referenced as
@@ -139,7 +143,7 @@ class RunStore:
         self._write_json("config.json", config_artifact.model_dump_json())
         self._created = True
 
-    def _write_json(self, rel: str, payload: str) -> None:
+    def _write_json(self, rel: str, payload: str) -> str:
         path = self.dir / rel
         if path.exists():
             raise ContractError(
@@ -151,6 +155,7 @@ class RunStore:
                 location=f"/{rel}",
             )
         path.write_text(payload, encoding="utf-8")
+        return f"sha256:{_sha256_bytes(payload.encode('utf-8'))}:{rel}"
 
     def _write_bytes(self, rel: str, payload: bytes) -> str:
         path = self.dir / rel
@@ -173,8 +178,16 @@ class RunStore:
         attempts_log: AttemptLogArtifact,
         raw_evidence: Any | None = None,
         prepared_evidence: Any | None = None,
+        reader_result: Any | None = None,
+        judge_record: Any | None = None,
+        scoring_trace: Any | None = None,
     ) -> dict[str, str]:
-        """Persist per-sample artifacts; returns checksummed refs."""
+        """Persist per-sample artifacts; returns checksummed refs.
+
+        reader_result / judge_record / scoring_trace are private harness
+        artifacts (the latter two carry gold): they are auditable records
+        and never inputs to any tested component.
+        """
         refs: dict[str, str] = {}
         safe = _safe_handle(sample_handle)
         refs["attempts"] = self._write_bytes(
@@ -191,7 +204,31 @@ class RunStore:
                 f"artifacts/{safe}/prepared_evidence.json",
                 prepared_evidence.model_dump_json().encode("utf-8"),
             )
+        if reader_result is not None:
+            refs["reader_result"] = self._write_bytes(
+                f"artifacts/{safe}/reader_result.json",
+                reader_result.model_dump_json().encode("utf-8"),
+            )
+        if judge_record is not None:
+            refs["judge_record"] = self._write_bytes(
+                f"artifacts/{safe}/judge_record.json",
+                judge_record.model_dump_json().encode("utf-8"),
+            )
+        if scoring_trace is not None:
+            refs["scoring"] = self._write_bytes(
+                f"artifacts/{safe}/scoring.json",
+                scoring_trace.model_dump_json().encode("utf-8"),
+            )
         return refs
+
+    def write_report(self, report_json: str, report_markdown: str) -> dict[str, str]:
+        """Persist the run summary report (JSON + Markdown)."""
+        return {
+            "report_json": self._write_json("report.json", report_json),
+            "report_markdown": self._write_bytes(
+                "report.md", report_markdown.encode("utf-8")
+            ),
+        }
 
     def append_result(self, result_artifact: Any) -> None:
         line = result_artifact.model_dump_json()
