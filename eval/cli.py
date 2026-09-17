@@ -7,8 +7,12 @@ given; without --out it prints the plan only (offline summary, nothing
 executed). resume continues an interrupted or partially failed run from
 its checkpoint directory: it refuses to reuse checkpoints whose config
 fingerprint, space identity or artifact schema version does not match
-and tells the user to start a new run. compare remains a config-level
-check until its milestone.
+and tells the user to start a new run. compare takes two run
+directories, checks comparability on every key field except the memory
+plan (the allowed experimental factor), refuses the same-condition
+label and metric auto-alignment on registry mismatch, reports both
+sides' full planned-set results and persists the common runnable
+intersection with its ID list.
 """
 
 from __future__ import annotations
@@ -275,20 +279,17 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
 
 def cmd_compare(args: argparse.Namespace) -> int:
-    left = _load_config_or_exit(args.left)
-    right = _load_config_or_exit(args.right)
-    same = left.fingerprint() == right.fingerprint()
-    plan = {
-        "command": "compare",
-        "left": {"config": left.name, "fingerprint": left.fingerprint()},
-        "right": {"config": right.name, "fingerprint": right.fingerprint()},
-        "same_config_fingerprint": same,
-        "same_sample_plan": left.sample_plan_id == right.sample_plan_id
-        and set(left.sample_ids) == set(right.sample_ids),
-        "status": "not-implemented (M1 performs config-level comparability "
-        "checks only; metric-level comparison lands with the runner)",
-    }
-    print(json.dumps(plan, indent=2, ensure_ascii=False))
+    from eval.compare import CompareError, compare_runs, save_comparison
+
+    try:
+        payload = compare_runs(args.left, args.right)
+    except (CompareError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    out_dir = args.out or str(Path(args.left).parent)
+    refs = save_comparison(payload, out_dir)
+    payload["artifacts"] = refs
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -361,9 +362,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_resume.set_defaults(func=cmd_resume)
 
-    p_compare = sub.add_parser("compare", help="compare two runs (M2)")
-    p_compare.add_argument("left")
-    p_compare.add_argument("right")
+    p_compare = sub.add_parser(
+        "compare",
+        help="compare two run directories (key-field comparability, both "
+        "full planned-set results and the common runnable intersection)",
+    )
+    p_compare.add_argument("left", metavar="RUN_DIR")
+    p_compare.add_argument("right", metavar="RUN_DIR")
+    p_compare.add_argument(
+        "--out",
+        default=None,
+        metavar="DIR",
+        help="directory for the compare artifact (default: the LEFT run's "
+        "parent directory; run directories stay immutable)",
+    )
     p_compare.set_defaults(func=cmd_compare)
 
     return parser

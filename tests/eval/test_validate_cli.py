@@ -24,6 +24,12 @@ def run_cli(*argv: str, capsys) -> tuple[int, str]:
     return code, capsys.readouterr().out
 
 
+def run_cli_capture(*argv: str, capsys) -> tuple[int, str, str]:
+    code = main(list(argv))
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
 class TestValidateCommand:
     def test_valid_config_and_fixtures_pass(self, capsys):
         code, out = run_cli(
@@ -184,26 +190,18 @@ class TestOtherCommands:
         assert payload["metrics_registry_version"] == "1"
         assert len(payload["config_fingerprint"]) == 64
 
-    def test_compare_same_config_flags_same_fingerprint(self, capsys):
+    def test_compare_takes_run_directories_not_configs(self, capsys, tmp_path):
+        # compare moved from config-level checks to run-directory
+        # comparison (issue #6); pointing it at a config is refused.
         config = "eval/configs/examples/offline_fake.toml"
-        code, out = run_cli("compare", config, config, capsys=capsys)
-        assert code == 0
-        payload = json.loads(out)
-        assert payload["same_config_fingerprint"] is True
+        code, out, err = run_cli_capture("compare", config, config, capsys=capsys)
+        assert code == 2
+        assert "run manifest missing" in err
 
-    def test_compare_different_configs(self, capsys):
-        # invalid config is refused with a structured error, exit code 2
+    def test_compare_requires_two_positional_run_dirs(self, capsys):
         with pytest.raises(SystemExit) as excinfo:
-            main(
-                [
-                    "compare",
-                    "eval/configs/examples/offline_fake.toml",
-                    "eval/configs/examples/invalid_bad_family.toml",
-                ]
-            )
+            main(["compare", "only-one"])
         assert excinfo.value.code == 2
-        err = capsys.readouterr().err
-        assert "config_validation" in err
 
     def test_resume_offline(self, capsys):
         # resume is wired to run directories now: --run is required and
