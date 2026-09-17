@@ -1,0 +1,63 @@
+# eval harness CI：smoke-offline 常跑（issue #6）。
+#
+# 全程不调用外部模型、评测路径无网络依赖：runner/reader/judge/memory
+# 均为 fake 组件（tests/eval/test_smoke_offline.py 用 socket 屏障证明
+# 整个闭环不触碰网络）。依赖安装之外的步骤均为纯本地计算。
+
+name: eval-ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: "23 3 * * 1" # 每周一常跑，滚动发现环境漂移
+
+jobs:
+  smoke-offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: 安装依赖（uv.lock 固定版本）
+        run: uv sync --frozen
+
+      - name: 结构校验（配置与契约 fixture）
+        run: >-
+          uv run hippo-eval validate
+          --config eval/configs/examples/offline_fake.toml
+          --config eval/configs/examples/offline_fake_ops.toml
+          --fixture eval/fixtures/manual/raw_evidence.exemplar.json
+          --fixture eval/fixtures/manual/result.exemplar.json
+          --fixture eval/fixtures/manual/valid.session.json
+
+      - name: 单元测试（365 存量 + compare + review 矩阵 14 项 + 冒烟确定性）
+        run: uv run pytest -q
+
+      - name: smoke-offline：固定 8 题两次确定性运行并比较
+        run: |
+          set -euo pipefail
+          uv run hippo-eval run --config eval/configs/examples/offline_fake.toml --out runs
+          uv run hippo-eval run --config eval/configs/examples/offline_fake.toml --out runs
+          LEFT=$(ls -d runs/run-* | sort | head -1)
+          RIGHT=$(ls -d runs/run-* | sort | tail -1)
+          uv run hippo-eval compare "$LEFT" "$RIGHT" > compare.json
+          python3 - <<'PY'
+          import json
+
+          with open("compare.json", encoding="utf-8") as fh:
+              payload = json.load(fh)
+          assert payload["comparability"]["same_condition"] is True, payload["comparability"]
+          assert payload["comparison_kind"] == "equal_budget"
+          assert payload["metrics"]["refused_reason"] is None
+          assert payload["intersection"]["size"] == 8
+          print("smoke-offline compare OK:", payload["left"]["run_id"], "vs", payload["right"]["run_id"])
+          PY
+
+      - name: 操作能力套件冒烟（无 LLM judge）
+        run: uv run hippo-eval run --config eval/configs/examples/offline_fake_ops.toml --out runs
