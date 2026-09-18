@@ -54,6 +54,16 @@ MATRIX: list[tuple[str, str]] = [
     ("budget_overrun_visible", "报告给出返回/进入 Reader/被移除截断的数量与 tokens；预算硬上限不被静默突破"),
     ("explicit_update_completion", "update() 后 inspect 给出 content=replacement、validity=current；旧文本不再作为当前值；sources=[] 不判失败"),
     ("scale_and_cost", "调用次数模型、fake 单位成本与外推估算在报告中并明确标注；smoke 子集 8 题固定"),
+    (
+        "model_version_drift",
+        "正式运行记录别名、响应 model 字段、厂商标注版本与日期四项标识；探测集输出留档；"
+        "版本变化即判为配置变更，不与历史 run 同条件比较",
+    ),
+    (
+        "judge_official_deviation",
+        "judge 协议逐字绑定官方 commit；自建 prompt 拒绝执行；与官方 GPT-4o 的偏离在报告中标注，"
+        "不宣称与论文分数可比（人工校准执行随 M2 校准票）",
+    ),
 ]
 IDS = [row_id for row_id, _ in MATRIX]
 
@@ -764,6 +774,135 @@ def check_scale_and_cost(m: dict[str, Any]) -> None:
     assert any("smoke" in note for note in report["limitations"])
 
 
+def check_model_version_drift(m: dict[str, Any]) -> None:
+    """模型版本漂移 (#8/#6 遗留)：四项标识 + 探测留档 + 漂移即配置变更。
+
+    Builds two fresh runs whose readers observed different server model
+    fields: the comparison must refuse the same-condition label instead
+    of silently aligning metrics across a repointed alias.
+    """
+    from eval.compare import compare_runs
+
+    base = Path(m["qa"]["run_dir"]).parent
+    config = load_config_toml(EXAMPLE_CONFIG)
+
+    class _Observed(FakeReader):
+        def __init__(self, spec, observed):
+            super().__init__(spec)
+            self.observed_models = {observed}
+
+    outcomes = []
+    for run_id, observed in (
+        ("run-matrix-drift-a", "m-1"),
+        ("run-matrix-drift-b", "m-2"),
+    ):
+        runner = _runner_for(base, config, run_id)
+        runner.reader = _Observed(
+            FakeReaderSpec.from_reader_plan(config.reader), observed
+        )
+        outcomes.append(runner.run())
+    a, b = outcomes
+    # Four identifiers archived per role + code version in both places
+    for run in (a, b):
+        versions = json.loads(
+            (run.run_dir / "model_versions.json").read_text(encoding="utf-8")
+        )
+        assert versions["code_version"]
+        for role in ("reader", "judge"):
+            record = versions[role]
+            assert record["alias"] and record["run_date"]
+        manifest = json.loads(
+            (run.run_dir / "run.json").read_text(encoding="utf-8")
+        )
+        assert manifest["code_version"] == versions["code_version"]
+    # Probe archive for a probe-configured run: fixed set, declared
+    # expected behavior, archived before the samples
+    probe_config = config.model_copy(
+        update={
+            "reader": config.reader.model_copy(
+                update={"probe_set_id": "reader-drift-probe@1"}
+            )
+        }
+    )
+    probed = _runner_for(base, probe_config, "run-matrix-drift-probe").run()
+    probe = json.loads(
+        (probed.run_dir / "artifacts" / "model_probes.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert len(probe["calls"]) == 10
+    assert all("expected_behavior" in c for c in probe["calls"])
+    # Drift = configuration change: refuse the same-condition label
+    payload = compare_runs(a.run_dir, b.run_dir)
+    assert payload["comparability"]["same_condition"] is False
+    assert any(
+        d["field"] == "/model_versions/reader/response_model"
+        for d in payload["comparability"]["differences"]
+    )
+
+
+def check_judge_official_deviation(m: dict[str, Any]) -> None:
+    """Judge 偏离官方模型 (#8 协议侧落成；人工校准随 M2 校准票)。
+
+    The official templates are verbatim ports of the pinned upstream
+    commit; a real judge refuses any other protocol (no self-made
+    prompts); real-judge reports state the deviation from the officially
+    validated GPT-4o instead of claiming paper comparability.
+    """
+    import shutil
+
+    from eval.config import JudgePlan
+    from eval.contracts.internal import JudgeRequest
+    from eval.judges.longmemeval import (
+        OFFICIAL_PROTOCOL_ID,
+        UPSTREAM_PROTOCOL_COMMIT,
+        render_official_prompt,
+    )
+    from eval.judges.openai_judge import OpenAIChatJudge
+    from eval.report import Reporter
+
+    assert OFFICIAL_PROTOCOL_ID == "longmemeval-anscheck@1"
+    assert UPSTREAM_PROTOCOL_COMMIT == "9e0b455f4ef0e2ab8f2e582289761153549043fc"
+    request = JudgeRequest(
+        question="Q",
+        expected_answer="pnpm",
+        hypothesis="pnpm",
+        question_type="multi-session",
+        protocol_id=OFFICIAL_PROTOCOL_ID,
+        protocol_fields={"abstention": False},
+    )
+    prompt = render_official_prompt(request)
+    assert prompt.startswith("I will give you a question, a correct answer")
+    assert prompt.endswith("Is the model response correct? Answer yes or no only.")
+    assert "rubric" not in prompt  # template selection follows upstream
+    # A real judge cannot run a self-made protocol
+    with pytest.raises(ValueError, match="official"):
+        OpenAIChatJudge(
+            JudgePlan(
+                model="glm-5.3",
+                model_family="glm",
+                base_url="https://api.example.com",
+                temperature=0.0,
+                protocol_id="longmemeval-yes-no@1",
+                protocol_source_commit="0" * 40,
+                api="openai_chat",
+                api_key_env="K",
+                vendor_documented_version="GLM-5.3",
+                vendor_documented_on="2026-09-18",
+            )
+        )
+    # Real-judge reports carry the non-comparability deviation note
+    base = Path(m["qa"]["run_dir"]).parent
+    copy = base / "run-matrix-judge-note"
+    if not copy.exists():
+        shutil.copytree(m["qa"]["run_dir"], copy)
+    config_doc = json.loads((copy / "config.json").read_text(encoding="utf-8"))
+    config_doc["config"]["judge"]["api"] = "openai_chat"
+    (copy / "config.json").write_text(json.dumps(config_doc, ensure_ascii=False))
+    report = Reporter(copy).build()
+    assert any("GPT-4o" in note for note in report["limitations"])
+
+
 CHECKS: dict[str, Callable[[dict[str, Any]], None]] = {
     "id_leakage": check_id_leakage,
     "question_date": check_question_date,
@@ -779,6 +918,8 @@ CHECKS: dict[str, Callable[[dict[str, Any]], None]] = {
     "budget_overrun_visible": check_budget_overrun_visible,
     "explicit_update_completion": check_explicit_update_completion,
     "scale_and_cost": check_scale_and_cost,
+    "model_version_drift": check_model_version_drift,
+    "judge_official_deviation": check_judge_official_deviation,
 }
 
 
@@ -795,6 +936,7 @@ def test_review_matrix(row_id: str, matrix) -> None:
 
 
 def test_matrix_rows_match_design_doc():
-    """The 14 rows are exactly the issue #6 acceptance list."""
-    assert len(MATRIX) == 14
-    assert len(set(IDS)) == 14
+    """The matrix rows are the issue #6 acceptance list plus the two
+    M2 rows (#8): model version drift and judge official deviation."""
+    assert len(MATRIX) == 16
+    assert len(set(IDS)) == 16

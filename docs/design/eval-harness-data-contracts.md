@@ -214,11 +214,21 @@ class PreparedEvidence:
     dropped_raw_indices: list[int]
 
 @dataclass(frozen=True)
+class TokenCalibration:
+    counting_mode: Literal["exact", "estimated", "test"]
+    tokenizer_id: str
+    local_prompt_tokens: int
+    server_prompt_tokens: int | None
+    delta_tokens: int | None   # server - local；服务端未报 usage 时为 null
+    note: str                  # 固定说明：预算执行以本地计数为准
+
+@dataclass(frozen=True)
 class ReaderResult:
     hypothesis: str
     raw_output: str
     model: str | None
     usage: ResourceUsage | None
+    calibration: TokenCalibration | None   # M2：本地计数与服务端 usage 的校准记录
 
 @dataclass(frozen=True)
 class ScoringData:
@@ -333,6 +343,8 @@ qa suite 的 operation_status 为 null；operations suite 的 qa_status/correct 
 | 组件表与工程结构补 `judges/`，`evidence/` 改名 `prepare/` | 官方协议 adapter 只出现在数据契约中，组件表与目录都没有对应位置，命名也不一致 | 保留原目录名并在文中说明映射；读者仍需自行对应 | 已采纳 |
 | Reader 与 Judge 使用不同家族模型（Judge 定为 GLM-5.3） | reader 与 judge 同模型时，自偏好偏差随各实现产生的答案文本变化，共享盲区还可能奖励检索更差的实现；统一模型只能消除跨条件不可比 | 同模型加事后人工校准；偏差仍不可控，且无法解释 2×2 归因 | 已采纳 |
 | `ReaderResult` / `JudgeResult` 增加 `model` 字段 | 两个模型都是滚动别名，需要按次记录服务端实际返回的模型标识，作为漂移检测与历史审计的依据 | 只依赖运行级配置快照记录版本；无法发现运行期间或跨运行的实际模型替换 | 已采纳 |
+| `ReaderResult` 增加 `calibration`（M2，#8） | 精确计数需要用每次服务端 `usage.prompt_tokens` 校准本地计数，不一致记录差值；预算执行仍以本地计数为准，估算与精确模式分开比较 | 只在报告里聚合差值，不留逐次调用记录；差值无法按题追溯，漂移不可审计 | 已采纳 |
+| `protocol_fields` 允许携带 `abstention`（M2，#8） | 官方 anscheck 协议按拒答标志选择模板；该标志是评分私有数据，只能经协议专用字段进入 judge，不能混入自由 prompt | 在 JudgeRequest 上加顶层字段；非官方协议不需要，顶层字段成为死字段 | 已采纳 |
 | 数据契约以 pydantic v2 模型作为单一真源 | dataclass 不做运行时校验；文档一套、校验一套会随时间漂移 | 保留文档 dataclass，另写校验模型 | 已采纳 |
 | 用量通过 contextvar 的 `UsageRecorder` 上报 | 原设计把传递机制留给实施，而 `retrieve` 签名固定、无法直接返回用量 | 修改 `retrieve` 等签名返回 `(结果, 用量)`；会破坏已定义的接口 | 已采纳 |
 

@@ -1,0 +1,116 @@
+# M2 real-run config: full_history baseline on the dev50 (50 questions).
+# Real reader (DeepSeek, OpenAI-compatible) + real judge (Z.ai, official
+# LongMemEval anscheck protocol). Credentials are read from the env vars
+# NAMED below (values never enter configs or artifacts):
+#   reader: DEEPSEEK_API_KEY   judge: ZAI_API_KEY
+# Prerequisites: scripts/fetch_longmemeval.py (pinned dataset) and
+# scripts/fetch_deepseek_tokenizer.py (pinned exact tokenizer).
+# 完整历史对照：不受 4K 证据预算约束，按上下文窗口整量提供；不参加排名检索指标 50 题开发集（划分清单 longmemeval-s-dev-50）。
+
+name = "real-dev50-full_history"
+dataset_plan = "longmemeval-s-cleaned@1"
+sample_plan_id = "longmemeval-s-dev-50"
+sample_ids = [
+  "06db6396",
+  "09ba9854",
+  "0f05491a",
+  "16c90bf4",
+  "1de5cff2",
+  "27016adc",
+  "28bcfaac",
+  "2a1811e2",
+  "3b6f954b",
+  "4bc144e2",
+  "4dfccbf8",
+  "5025383b",
+  "54026fce",
+  "5831f84d",
+  "60159905",
+  "6c49646a",
+  "6d550036",
+  "71a3fd6b",
+  "720133ac",
+  "8550ddae",
+  "8a137a7f",
+  "94f70d80",
+  "982b5123",
+  "a3838d2b",
+  "a89d7624",
+  "a96c20ee",
+  "b01defab",
+  "b6025781",
+  "ba358f49_abs",
+  "ba61f0b9",
+  "c8c3f81d",
+  "c8f1aeed",
+  "ce6d2d27",
+  "d905b33f",
+  "dfde3500",
+  "ec81a493",
+  "ef9cf60a",
+  "f4f1d8a4_abs",
+  "f685340e_abs",
+  "gpt4_0b2f1d21",
+  "gpt4_1d80365e",
+  "gpt4_468eb063",
+  "gpt4_5438fa52",
+  "gpt4_70e84552_abs",
+  "gpt4_7de946e7",
+  "gpt4_8e165409",
+  "gpt4_98f46fc6",
+  "gpt4_cd90e484",
+  "gpt4_d12ceb0e",
+  "gpt4_fa19884d",
+]
+smoke_subset_ids = []
+evidence_token_budget = 4096
+notes = "M2 real-model run; baseline_kind=full_history; probe set executes 10 drift prompts before samples."
+
+[memory]
+name = "baseline-full_history"
+baseline_kind = "full_history"
+capabilities = [
+  "extractive_evidence",
+]
+
+[memory.config]
+
+
+[reader]
+model = "deepseek-flash"
+model_family = "deepseek"
+base_url = "https://api.deepseek.com"
+api = "openai_chat"
+api_key_env = "DEEPSEEK_API_KEY"
+temperature = 0.0
+max_output_tokens = 1024
+tokenizer_id = "deepseek-offline:v1"
+counting_mode = "exact"
+context_window_tokens = 1000000
+format_overhead_tokens = 64
+output_reserve_tokens = 2048
+prompt_template_id = "longmemeval-reader-zh@1"
+probe_set_id = "reader-drift-probe@1"
+vendor_documented_version = "DeepSeek-V4.1-Flash"
+vendor_documented_on = "2026-09-18"
+request_timeout_s = 180.0
+
+[judge]
+model = "glm-5.3"
+model_family = "glm"
+base_url = "https://api.z.ai/api/paas/v4"
+api = "openai_chat"
+api_key_env = "ZAI_API_KEY"
+temperature = 0.0
+max_output_tokens = 10
+protocol_id = "longmemeval-anscheck@1"
+protocol_source_commit = "9e0b455f4ef0e2ab8f2e582289761153549043fc"
+vendor_documented_version = "GLM-5.3"
+vendor_documented_on = "2026-09-18"
+request_timeout_s = 180.0
+
+[run_params]
+max_retries = 3
+backoff_base_s = 1.0
+await_ready_timeout_s = 300.0
+question_concurrency = 4

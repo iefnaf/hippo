@@ -1,0 +1,83 @@
+# M2 real-run config: bm25 baseline on the smoke-live (8 questions).
+# Real reader (DeepSeek, OpenAI-compatible) + real judge (Z.ai, official
+# LongMemEval anscheck protocol). Credentials are read from the env vars
+# NAMED below (values never enter configs or artifacts):
+#   reader: DEEPSEEK_API_KEY   judge: ZAI_API_KEY
+# Prerequisites: scripts/fetch_longmemeval.py (pinned dataset) and
+# scripts/fetch_deepseek_tokenizer.py (pinned exact tokenizer).
+# BM25 基线：上游 flat-bm25 定义（用户轮次文档、空白分词、BM25Okapi 默认参数），k=10 会话 8 题固定冒烟子集；成绩不进入正式报告。
+
+name = "real-smoke-live-bm25"
+dataset_plan = "longmemeval-s-cleaned@1"
+sample_plan_id = "longmemeval-s-smoke-8"
+sample_ids = [
+  "1de5cff2",
+  "4dfccbf8",
+  "6c49646a",
+  "8550ddae",
+  "a89d7624",
+  "ba61f0b9",
+  "f4f1d8a4_abs",
+  "gpt4_70e84552_abs",
+]
+smoke_subset_ids = [
+  "1de5cff2",
+  "4dfccbf8",
+  "6c49646a",
+  "8550ddae",
+  "a89d7624",
+  "ba61f0b9",
+  "f4f1d8a4_abs",
+  "gpt4_70e84552_abs",
+]
+evidence_token_budget = 4096
+notes = "M2 real-model run; baseline_kind=bm25; probe set executes 10 drift prompts before samples."
+
+[memory]
+name = "baseline-bm25"
+baseline_kind = "bm25"
+capabilities = [
+  "extractive_evidence",
+]
+
+[memory.config]
+k = 10  # sessions returned per query (upstream default; M2 recheck parameter)
+
+[reader]
+model = "deepseek-flash"
+model_family = "deepseek"
+base_url = "https://api.deepseek.com"
+api = "openai_chat"
+api_key_env = "DEEPSEEK_API_KEY"
+temperature = 0.0
+max_output_tokens = 1024
+tokenizer_id = "deepseek-offline:v1"
+counting_mode = "exact"
+context_window_tokens = 1000000
+format_overhead_tokens = 64
+output_reserve_tokens = 2048
+prompt_template_id = "longmemeval-reader-zh@1"
+probe_set_id = "reader-drift-probe@1"
+vendor_documented_version = "DeepSeek-V4.1-Flash"
+vendor_documented_on = "2026-09-18"
+request_timeout_s = 180.0
+
+[judge]
+model = "glm-5.3"
+model_family = "glm"
+base_url = "https://api.z.ai/api/paas/v4"
+api = "openai_chat"
+api_key_env = "ZAI_API_KEY"
+temperature = 0.0
+max_output_tokens = 10
+protocol_id = "longmemeval-anscheck@1"
+protocol_source_commit = "9e0b455f4ef0e2ab8f2e582289761153549043fc"
+vendor_documented_version = "GLM-5.3"
+vendor_documented_on = "2026-09-18"
+request_timeout_s = 180.0
+
+[run_params]
+max_retries = 3
+backoff_base_s = 1.0
+await_ready_timeout_s = 300.0
+question_concurrency = 4

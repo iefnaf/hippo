@@ -42,3 +42,19 @@ JSON/Markdown 汇总报告，全程 fake 组件、不调外部模型）。
   “六题型各 1 + 拒答 2”抽取，仅取开发集侧）
 - 真实数据冒烟（离线 fake 组件）：`uv run hippo-eval run --config eval/configs/examples/real_smoke_offline.toml --out runs`
   （8 题真实题目走完整离线闭环；未下载数据时相关测试自动跳过，CI 不依赖该文件）
+- 精确 tokenizer（M2，#8）：`uv run python scripts/fetch_deepseek_tokenizer.py`
+  （下载 revision 固定的 `deepseek-ai/DeepSeek-V3` `tokenizer.json`，校验
+  sha256/大小并在加载时复核；`counting_mode=exact` 依赖该文件，缺失时运行
+  显式报错而非静默换计数模式。文件不入 Git，pin 记录在
+  `eval/prepare/tokens.py`，provenance 落盘 `data/tokenizers/deepseek-v3/`）
+- 真实模型基线（M2，#8）：先设置凭证环境变量（只以变量名进配置，值绝不落盘）
+  `export DEEPSEEK_API_KEY=... ZAI_API_KEY=...`，然后按基线运行 8 题冒烟或
+  50 题开发集：
+  `uv run hippo-eval run --config eval/configs/examples/real_smoke_live_bm25.toml --out runs`
+  （另有 `_none` / `_full_history` 冒烟与 `real_dev50_{none,bm25,full_history}`
+  开发集配置。真实 reader 走 OpenAI 兼容接口并统一查询上下文与提问时间；
+  官方 anscheck judge 协议逐字绑定上游 commit；精确计数以本地 tokenizer 执行
+  预算、用服务端 usage 校准并记录差值；上下文预检超限记 `context_exceeded`；
+  运行头留档四项版本标识（别名/响应 model 字段/厂商标注+日期/运行日期）与
+  10 条固定漂移探测输出 `artifacts/model_probes.json`。无凭证时 live 测试显式
+  skip，离线部分（BM25/预检/计数校准逻辑）不依赖网络）

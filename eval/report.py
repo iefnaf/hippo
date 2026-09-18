@@ -413,6 +413,13 @@ class Reporter:
                 "估算计数模式（estimated）：预算与 tokens 数字为估算口径，"
                 "与精确计数（exact）结果分开比较，不并表。",
             )
+        if config["judge"].get("api") == "openai_chat":
+            limitations.insert(
+                0,
+                "judge 与官方论文验证过的 GPT-4o 不同家族（偏离已随运行头"
+                "版本记录留档）：不宣称与论文分数可比，正式结论前须完成"
+                "“Judge 校准”的 100+20 人工判定。",
+            )
         if statuses["invalid_input"]:
             limitations.insert(
                 0,

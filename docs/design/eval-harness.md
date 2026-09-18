@@ -293,6 +293,8 @@ Memory 返回证据，不直接承担最终答案生成。只实现写入与检�
 
 完整历史超出 reader 上下文限制时明确标记为不可运行，不静默截断。其结果用于信息充分程度的对照，不作为等预算检索结果。BM25 沿用上游 `flat-bm25` 的分词与打分定义，分词、k1、b 使用上游默认值不做调优，只记录实现 commit；文档单元为单个会话（会话内消息按时间拼接），返回 k = 10 个会话，并列时按（分数降序、会话时间升序、session_id 字典序）稳定排序。命中会话按会话内顺序逐消息展开为消息级原文证据，以满足“一个原文单元只引用一个消息范围”的约束，预算截断在展开之后执行。
 
+M2 落成（#8）时上述“上游定义”绑定到具体实现：commit `9e0b455f4ef0e2ab8f2e582289761153549043fc`（`src/retrieval/run_retrieval.py`）。文档单元按上游会话粒度实现——会话内 **user 轮次** 内容以单个空格拼接（上游按 `role == 'user'` 过滤，assistant/tool 轮次不入索引，但命中会话展开为消息级证据时全部轮次都返回）；分词为上游的 `doc.split(" ")`（纯空白切分，不做小写化或词干化），查询同法分词；打分用 `rank_bm25.BM25Okapi` 默认参数（k1=1.5、b=0.75、epsilon=0.25），k1/b 不进配置、不可调优；k=10 可经 memory 配置覆盖（M2 待复核参数）。
+
 本设计的 reader 上下文为 1M tokens，LongMemEval-S 的完整历史约 115k tokens，因此完整历史基线在 S 上预期全部可运行，`context_exceeded` 主要出现在更长的历史或上下文更小的 reader 配置下。论文的 reader 使用 128k 上下文，本 harness 的绝对值与论文不可比，比较只在本 harness 内成立。
 
 上下文预检包含历史、问题、公共 prompt、消息格式开销及预留输出长度；预留输出长度按 reader 配置固定，不取模型的最大输出上限。失败使用 `context_exceeded` 状态。完整历史的无排名输出和无记忆基线不参加排名检索指标，两者仍参加辅助问答，按下述统一状态与统计规则报告。声明提供原文检索的 BM25/hippo 才参与对应的原文 recall 比较。
@@ -332,6 +334,8 @@ Reader 和 judge 通过 OpenAI-compatible API 调用，分别配置 base URL、�
 位级可复现不成立：相同输入不保证相同输出，别名也可能被随时重新指向；报告必须写明这一限制。若将来需要严格复现，改用提供固定快照的托管商，而不是继续依赖滚动别名。
 
 Reader 的 tokenizer 使用 DeepSeek 官方离线 tokenizer 精确计数，并用每次调用返回的 `usage` 反查实际 prompt tokens 做校准；两者不一致时记录差值，预算执行仍以本地计数为准并标明计数模式。
+
+M2 落成（#8）：精确计数加载 revision 固定的 `deepseek-ai/DeepSeek-V3` `tokenizer.json`（pin 记录含 sha256/大小/许可/核对日期，文件不入 Git，经 `scripts/fetch_deepseek_tokenizer.py` 获取并在加载时复核校验值）；`counting_mode` 三态——`exact`（上述精确计数）、`estimated`（文档化启发式 ceil(chars/4)，结果标记估算口径）、`test`（M1 字符计数器，仅离线）。计数模式与 tokenizer id 是可比性关键项：估算与精确结果分开比较，绝不并表。校准差值落在逐次调用的 `ReaderResult.calibration` 与报告诊断块（差值≠0 计数、均值/最大差值），不进入正式指标。上下文预检按配置字段执行：`context_window_tokens`（不设则不预检，M1 行为保持）、`format_overhead_tokens`（消息格式开销的扁平估计）、`output_reserve_tokens`（固定输出预留，不取模型最大输出上限）、`prompt_template_id`（公共 prompt 模板注册表）。预检构成 = 公共 prompt+问题 + 证据（等预算基线取证据预算上界、完整历史取实际全量渲染）+ 消息格式开销 + 固定输出预留；超限记 `context_exceeded`（终态、先于一切 adapter 与模型调用、可运行覆盖率因此有真实分母）。
 
 Judge 沿用 LongMemEval 官方 prompt 模板与 yes/no 解析语义，但所用模型不同于官方验证过的 GPT-4o，因此不宣称与论文分数可比，也不复用论文“与专家一致率 ≥90%”的结论。首版按下文“Judge 校准”执行：100 条随机样本加 20 条边界样本，单人盲标并做自身一致性复核；未达标的配置不得用于正式结论。
 
@@ -473,20 +477,31 @@ recall 与问答各自汇总回答不了“未找到证据”和“找到证据�
 ```text
 eval/
   datasets/
-  memories/
-  prepare/          # Reader 输入准备：校验、渲染与预算
-  readers/
-  judges/           # Judge 与官方协议 adapter
+  memories/         # adapter 协议、usage 上报、离线 fake 与三种基线（baselines.py）
+  prepare/          # Reader 输入准备：校验、渲染、预算（evidence.py）、
+                    # 计数器（tokens.py：exact/estimated/test）与上下文预检（context.py）
+  readers/          # fake 与 OpenAI 兼容真实 reader（openai_reader.py）
+  judges/           # fake、官方协议 adapter（longmemeval.py）与真实 judge（openai_judge.py）
   scorers/
   configs/
+  models.py         # 版本四项标识与漂移探测集
+  prompts.py        # 公共 prompt 模板注册表（单一真源）
+  versioning.py     # 代码版本（git HEAD+dirty）
   runner.py
   report.py
+scripts/
+  fetch_longmemeval.py        # 固定版本数据获取与校验
+  fetch_deepseek_tokenizer.py # 固定版本 tokenizer 获取与校验
 tests/
   eval/
 docs/design/
   eval-harness.md
   eval-harness-data-contracts.md
 ```
+
+每次运行除下述产物外，还写入 `model_versions.json`（四项版本标识与
+`code_version`）与（配置了探测集时）`artifacts/model_probes.json`（固定
+探测 prompt 的输出留档）；两者都是运行头诊断工件，不进入逐题指标。
 
 CLI 提供运行、恢复和比较三种操作，具体命令名在实现时确定。
 
@@ -513,7 +528,7 @@ CLI 提供运行、恢复和比较三种操作，具体命令名在实现时确�
 | 阶段 | 前置条件 | 可审阅产物 | 完成条件 |
 | --- | --- | --- | --- |
 | M1：离线协议与恢复 | 本设计及已确认范围；不依赖真实数据下载或真实模型 | 人工 fixtures、可控 fake memory/reader/judge、数据与回执类型、指标注册表、离线配置、固定 8 题 smoke 子集、运行/恢复/比较 CLI、示例 JSONL 与汇总报告 | 全程不调用外部模型；人工样本覆盖隔离、提问时间、预算、原文验证、状态统计、联合归因与下表各项 review 检查；故障注入后可恢复，原配置两次确定性运行可比较；smoke 子集固定为 8 题（六个 `question_type` 各 1 条加拒答 2 条），ID 清单写入配置，成绩不进入正式报告 |
-| M2：真实开发集基线 | M1 完成；按已确定事项加载数据版本与许可证记录、reader/judge 配置、评分协议与 tokenizer，并固定仍待定的运行参数 | 数据下载与校验说明、数据清单、50/450 划分清单、judge 校准记录（rubric、抽样清单、标注、一致率与阈值判定）、三种基线 adapter、官方评分接入、50 题基线报告及比较结果 | 两个划分无重叠且覆盖 500 题；judge 校准在 100 条随机样本上完成并给出明确的阈值判定；三种基线都有完整报告，上下文超限可追踪；每题达到明确终态，成绩包含既定分母、状态、覆盖率和资源信息 |
+| M2：真实开发集基线 | M1 完成；按已确定事项加载数据版本与许可证记录、reader/judge 配置、评分协议与 tokenizer，并固定仍待定的运行参数 | 数据下载与校验说明、数据清单、50/450 划分清单、judge 校准记录（rubric、抽样清单、标注、一致率与阈值判定）、三种基线 adapter、官方评分接入、50 题基线报告及比较结果 | 两个划分无重叠且覆盖 500 题；judge 校准在 100 条随机样本上完成并给出明确的阈值判定；三种基线都有完整报告，上下文超限可追踪；每题达到明确终态，成绩包含既定分母、状态、覆盖率和资源信息（#8 已落成：真实 reader/judge 接入、三种基线、精确计数与校准、上下文预检、四项版本标识与探测留档、smoke-live 与 dev50 示例配置；judge 人工校准与 50 题正式报告的执行随凭证就绪与校准票完成） |
 | M3：完整基线评测 | M2 完成；固定正式实验配置，保留集不参与日常调参 | 450 题保留集报告、50 题开发集报告及明确包含开发集的 500 题汇总、同条件比较产物 | P 内每题达到明确终态，无静默丢题；已评分题可追溯到实际证据及 judge 判定，失败与超限题可追溯到阶段状态及原因；保留集和开发集分别展示 |
 
 M1 的 fake 成绩仅验证 harness 行为，不是实际 memory 的性能结果。fake 使用明确标记的测试计数器验证 4096 的预算执行，不能宣称已匹配真实 reader tokenizer；reader 模型与官方离线 tokenizer 已在模型配置中固定，M1 只需验证计数器可替换。三个阶段均不要求 hippo 已实现；完成后通过相同接口接入 hippo，不将“优于基线”当作 harness 验收条件。
@@ -551,8 +566,8 @@ Review 修订对应的验收检查：
 | 显式更新完成条件 | `update()` 后 `inspect` 必须给出 `content=replacement`、`validity=current`；旧文本不得再作为当前值返回；`sources=[]` 不判失败 |
 | 规模与成本未知 | M1 给出调用次数模型与 fake 单位成本；M2 正式运行前完成外推并标注估算；smoke 子集题量与 ID 清单已固定 |
 | Reader 与 Judge 同源 | 配置快照分别记录两者模型名、版本、端点与 thinking 参数；两者不属同一模型家族 |
-| 模型版本漂移 | 正式运行前记录别名、响应 `model` 字段、厂商标注版本与日期；版本变化即判为配置变更，不与历史 run 混比；探测集输出留档 |
-| Judge 偏离官方模型 | 按“Judge 校准”执行 100 条随机样本与 20 条边界样本的判定；报告总体一致率与 Wilson 区间、混淆矩阵、分题型与拒答子集结果、自身一致率与跨条件差；标明与官方 GPT-4o 的偏离，不宣称与论文分数可比 |
+| 模型版本漂移 | 正式运行前记录别名、响应 `model` 字段、厂商标注版本与日期；版本变化即判为配置变更，不与历史 run 混比；探测集输出留档（M2 #8 已落成：`model_versions.json` 四项标识 + `reader-drift-probe@1` 10 条探测留档 + compare 对响应 model 字段/探测 digest 不一致拒同条件标记） |
+| Judge 偏离官方模型 | 按“Judge 校准”执行 100 条随机样本与 20 条边界样本的判定；报告总体一致率与 Wilson 区间、混淆矩阵、分题型与拒答子集结果、自身一致率与跨条件差；标明与官方 GPT-4o 的偏离，不宣称与论文分数可比（#8 已落成协议侧：anscheck 模板与解析语义逐字绑定上游 commit 9e0b455f、偏离随版本记录留档；人工校准执行随 M2 校准票落成） |
 
 ## 已确定事项与仍待定事项
 
@@ -576,7 +591,7 @@ Review 修订对应的验收检查：
 | 重试、超时与并发 | 重试上限 3 次、退避 1s/4s/16s 加抖动；`await_ready` 超时 300 秒；M1 离线并发 1（确定性），正式运行并发 4、题内串行 | 默认值，M2 按后端实测复核 |
 | 冒烟数据 | 人工 fixtures 加 `longmemeval_oracle.json` 固定 8 题（六个 `question_type` 各 1 条加拒答 2 条，固定种子抽取，ID 清单写入配置）；`smoke-offline` 用 fake 供 CI 常跑，`smoke-live` 从 M2 起用真实模型，成绩不进正式报告 | 用户确认；oracle 只含证据会话 |
 | 后继 suite 方向 | 第一版不纳入 LongMemEval-V2；M3 结束后评估，届时需扩展消息模型支持多模态 | 上游论文与数据集页 |
-| 模型版本固定策略 | 记录别名、响应 `model` 字段、厂商版本与运行日期四项；漂移即视为配置变更，不与历史 run 同条件比较；reader/judge 调用全部留档；每次正式运行执行固定探测 prompt（首版 10 条）。将来需要严格复现时改用提供固定快照的托管商 | 两家均为滚动别名，参数规模使自托管不在第一版可行范围内 |
+| 模型版本固定策略 | 记录别名、响应 `model` 字段、厂商版本与运行日期四项；漂移即视为配置变更，不与历史 run 同条件比较；reader/judge 调用全部留档；每次正式运行执行固定探测 prompt（首版 10 条）。将来需要严格复现时改用提供固定快照的托管商 | 两家均为滚动别名，参数规模使自托管不在第一版可行范围内（M2 #8 落成工件：运行头 `model_versions.json`、探测集 `reader-drift-probe@1`（题面+期望行为入指纹、固定提问日期）、`artifacts/model_probes.json` 留档、RunManifest 增 `code_version`（git HEAD+dirty）） |
 | 完整历史定位 | reader 上下文 1M、S 的完整历史约 115k tokens，完整历史基线在 S 上预期全部可运行；预留输出长度按配置固定，不取模型上限 | 上游数据规模与模型规格 |
 
 ### 仍待定事项
