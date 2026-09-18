@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "dataset_plan": "longmemeval-s-cleaned@1",
+  "source_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+  "split_sha256": "37d62e86fcad65ee479e0cef9275f17df63888e844c20b7ad126ff3e432fe71b",
+  "algorithm": "smoke-hashrank@1",
+  "seed": "hippo-longmemeval-s-smoke@1",
+  "smoke_ids": [
+    "1de5cff2",
+    "4dfccbf8",
+    "6c49646a",
+    "8550ddae",
+    "a89d7624",
+    "ba61f0b9",
+    "f4f1d8a4_abs",
+    "gpt4_70e84552_abs"
+  ],
+  "per_question_type": {
+    "knowledge-update": "ba61f0b9",
+    "multi-session": "6c49646a",
+    "single-session-assistant": "1de5cff2",
+    "single-session-preference": "a89d7624",
+    "single-session-user": "8550ddae",
+    "temporal-reasoning": "4dfccbf8"
+  },
+  "abstention_ids": [
+    "gpt4_70e84552_abs",
+    "f4f1d8a4_abs"
+  ]
+}
