@@ -38,6 +38,7 @@ ATTEMPT_KINDS = ("logical", "retry", "replay")
 #: and "inspect" are the operations-suite stages: explicit mutations and
 #: the only state-observation channel.
 STAGE_NAMES = (
+    "precheck",
     "ingest",
     "await_ready",
     "update",
@@ -445,7 +446,10 @@ class ScoringTraceArtifact(SchemaVersionedModel):
     stage: Literal["score"] = "score"
     scoring: ScoringData
     evidence_mode: Literal[
-        "extractive_declared", "generated_only", "none_baseline"
+        "extractive_declared",
+        "generated_only",
+        "none_baseline",
+        "full_history_control",
     ]
     gold_internal_sessions: list[str]
     actual_sessions_in_order: list[str]

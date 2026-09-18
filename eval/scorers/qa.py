@@ -65,6 +65,14 @@ EVIDENCE_MODE_NA_REASON = (
     "evidence_mode: the implementation does not declare "
     "extractive_evidence, so verifiable session recall is N/A"
 )
+#: Unranked controls (no-memory / full history) never enter ranking
+#: retrieval metrics (issue #3 leftover; registry na_condition
+#: 'ranking_baseline'). They still take part in auxiliary QA.
+RANKING_BASELINE_NA_REASON = (
+    "ranking_baseline: the {kind} control is unranked and never enters "
+    "ranking retrieval metrics (registry condition 'ranking_baseline'); "
+    "it still takes part in auxiliary QA"
+)
 
 
 class ScoringDataError(ContractError):
@@ -247,16 +255,30 @@ class QAScorer:
             )
 
         gold = list(scoring.gold_source_ids)
-        applicable = (not scoring.is_abstention) and self._extractive_declared
+        # Applicable set E for ranking retrieval metrics (issue #3
+        # leftover, consumed here): non-abstention, declared extractive,
+        # AND a ranked implementation. The unranked controls (no-memory,
+        # full history) never enter ranking recall even when they declare
+        # extractive evidence — the registry carries the N/A condition
+        # 'ranking_baseline' for exactly this case.
+        unranked_baseline = self._baseline_kind in ("none", "full_history")
+        applicable = (
+            (not scoring.is_abstention)
+            and self._extractive_declared
+            and not unranked_baseline
+        )
         if applicable:
             na_reason: str | None = None
             recall = session_recall(gold, ordered_sessions)
         else:
-            na_reason = (
-                ABSTENTION_NA_REASON
-                if scoring.is_abstention
-                else EVIDENCE_MODE_NA_REASON
-            )
+            if scoring.is_abstention:
+                na_reason = ABSTENTION_NA_REASON
+            elif unranked_baseline:
+                na_reason = RANKING_BASELINE_NA_REASON.format(
+                    kind=self._baseline_kind
+                )
+            else:
+                na_reason = EVIDENCE_MODE_NA_REASON
             recall = None
 
         metrics: list[MetricResult] = []
@@ -314,11 +336,18 @@ class QAScorer:
                 )
             )
 
-        # Evidence-side hit for the 2x2 attribution (fixed per mode).
+        # Evidence-side hit for the 2x2 attribution (fixed per mode). The
+        # full-history control has no VERIFIABLE gold comparison (its
+        # "hit" is not retrieval quality): hit = non-empty evidence, like
+        # other unranked controls (docs: 联合归因 命中口径).
         if self._baseline_kind == "none":
             evidence_mode = "none_baseline"
             hit_criterion = "never"
             hit = False
+        elif self._baseline_kind == "full_history":
+            evidence_mode = "full_history_control"
+            hit_criterion = "nonempty_evidence"
+            hit = bool(prepared is not None and prepared.items)
         elif self._extractive_declared:
             evidence_mode = "extractive_declared"
             hit_criterion = "gold_recall"

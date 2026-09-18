@@ -615,7 +615,10 @@ class TestResume:
 
         runner2, _ = make_runner(tmp_path, config, run_id="run-crash")
         outcome = runner2.resume()
-        assert outcome.scored == 1
+        # Reused terminal samples now count into the outcome statuses too
+        # (2 prior scored + the re-run sample = 3); their artifacts below
+        # are still byte-identical.
+        assert outcome.scored == 3
         assert outcome.re_run == 1
         assert outcome.reused == 2
         assert outcome.re_run_handles == [self.THREE[2]]

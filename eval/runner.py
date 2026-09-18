@@ -89,7 +89,16 @@ from eval.runs import (
     SamplePlanCounts,
     inline_ref,
 )
-from eval.prepare.tokens import TestCharTokenizer
+from eval.prepare.tokens import (
+    TokenizerUnavailable,
+    build_token_counter,
+)
+from eval.prepare.context import (
+    check_context,
+    full_history_allowance,
+)
+from eval.prompts import get_prompt_template, public_prompt_tokens
+from eval.memories.baselines import full_history_evidence
 from eval.scorers.qa import QAScorer, SampleScoring, ScoringDataError
 
 QueryStages = ("ingest", "await_ready", "retrieve", "prepare", "read", "score", "judge")
@@ -110,6 +119,37 @@ class _AwaitTimeout(Exception):
     def __init__(self, error: ErrorInfo) -> None:
         super().__init__(f"await_ready: {error.code}")
         self.error = error
+
+
+class _ContextExceeded(Exception):
+    """The precheck proved the full reader input cannot fit the context
+    window (M2).
+
+    The sample ends in qa_status='context_exceeded': no reader call, no
+    silent truncation, zero contribution to planned-question scores and
+    a separate status count (runnable_coverage gets its real denominator).
+    """
+
+    def __init__(self, stage: str, error: ErrorInfo) -> None:
+        super().__init__(f"{stage}: {error.code}")
+        self.stage = stage
+        self.error = error
+
+
+def _jsonable(value: Any) -> Any:
+    if value is None:
+        return None
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if hasattr(value, "to_dict") and not isinstance(value, type):
+        return value.to_dict()
+    if isinstance(value, list):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, tuple):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    return value
 
 
 class _UncertainMutation(Exception):
@@ -148,6 +188,7 @@ class RunOutcome:
     results: list[ResultArtifact] = field(default_factory=list)
     failed: int = 0
     invalid_input: int = 0
+    context_exceeded: int = 0
     scored: int = 0
     re_run: int = 0
     reused: int = 0
@@ -161,6 +202,7 @@ class RunOutcome:
             "samples": len(self.results),
             "scored": self.scored,
             "failed": self.failed,
+            "context_exceeded": self.context_exceeded,
             "invalid_input": self.invalid_input,
             "pending": sum(
                 1 for r in self.results if r.result.qa_status == "pending"
@@ -710,6 +752,17 @@ class RunnerBase:
             )
 
 
+@dataclass(frozen=True)
+class _PrecheckOutcome:
+    """What the precheck hands to the sample pipeline."""
+
+    #: Full-history render computed under the context allowance (None
+    #: for budget-bound baselines or a failed precheck).
+    prepared: PreparedEvidence | None = None
+    #: Context-derived prepare budget for the full-history control.
+    allowance: int | None = None
+
+
 class OfflineRunner(RunnerBase):
     """Runs the offline QA loop for every configured sample.
 
@@ -741,6 +794,21 @@ class OfflineRunner(RunnerBase):
         )
         self.dataset = dataset
         self.reader = reader
+        # Counting mode is fixed by the config: test (M1 fake), exact
+        # (pinned offline tokenizer) or estimated (documented heuristic).
+        # A missing pinned tokenizer file is a loud config/runtime error,
+        # never a silent fallback to another counting mode.
+        try:
+            self._tokenizer = build_token_counter(
+                config.reader.counting_mode,
+                tokenizer_id=config.reader.tokenizer_id,
+            )
+        except TokenizerUnavailable as exc:
+            raise ContractError(
+                code="tokenizer_unavailable",
+                message=exc.message,
+                location="/reader/counting_mode",
+            ) from exc
         self._scorer = QAScorer(
             dataset=dataset,
             judge=judge,
@@ -842,9 +910,15 @@ class OfflineRunner(RunnerBase):
         return outcome
 
     def _terminal(self, result: Result) -> bool:
-        # scored and invalid_input are terminal: invalid scoring data is
-        # a data error to fix with a NEW run, not something to retry.
-        return result.qa_status in ("scored", "invalid_input")
+        # scored, invalid_input and context_exceeded are terminal: the
+        # precheck verdict is a fixed property of (sample, config), not
+        # something a retry could change; invalid scoring data is a data
+        # error to fix with a NEW run, not something to retry.
+        return result.qa_status in (
+            "scored",
+            "invalid_input",
+            "context_exceeded",
+        )
 
     def _load_ref_model(self, ref: str | None, model: Any) -> Any | None:
         if ref is None:
@@ -889,6 +963,18 @@ class OfflineRunner(RunnerBase):
         # full re-run of the sample from its own operation log
         return plan
 
+    @staticmethod
+    def _count_terminal_status(outcome: RunOutcome, artifact: ResultArtifact) -> None:
+        status = artifact.result.qa_status
+        if status == "failed":
+            outcome.failed += 1
+        elif status == "context_exceeded":
+            outcome.context_exceeded += 1
+        elif status == "invalid_input":
+            outcome.invalid_input += 1
+        elif status == "scored":
+            outcome.scored += 1
+
     def _execute(
         self, async_mutation: bool, resume: dict[str, Any] | None
     ) -> RunOutcome:
@@ -898,16 +984,12 @@ class OfflineRunner(RunnerBase):
             if prior is not None and self._terminal(prior.result):
                 outcome.results.append(prior)
                 outcome.reused += 1
+                self._count_terminal_status(outcome, prior)
                 continue
             plan = self._resume_plan(prior) if prior is not None else None
             artifact = self._run_sample(handle, async_mutation, resume=plan)
             outcome.results.append(artifact)
-            if artifact.result.qa_status == "failed":
-                outcome.failed += 1
-            elif artifact.result.qa_status == "invalid_input":
-                outcome.invalid_input += 1
-            elif artifact.result.qa_status == "scored":
-                outcome.scored += 1
+            self._count_terminal_status(outcome, artifact)
             if resume is not None:
                 outcome.re_run += 1
                 outcome.re_run_handles.append(handle)
@@ -1034,9 +1116,33 @@ class OfflineRunner(RunnerBase):
         attempts: list[StageAttempt],
         entries: list[AttemptEntry],
         attempt_kind: str = "logical",
+        *,
+        budget: int | None = None,
+        prepared_override: PreparedEvidence | None = None,
     ) -> PreparedEvidence:
-        """Budget preparation is deterministic: no retries, no patching."""
-        tokenizer = TestCharTokenizer()
+        """Budget preparation is deterministic: no retries, no patching.
+
+        budget defaults to the config evidence budget. The full-history
+        control instead passes the CONTEXT-DERIVED allowance (it is not
+        bound by the 4K retrieval budget; the precheck has proven the
+        full render fits), or a prepared_override computed by the
+        precheck itself (identical by determinism, kept for audit as a
+        recorded stage attempt).
+        """
+        effective_budget = budget if budget is not None else self.config.evidence_token_budget
+
+        def _run() -> PreparedEvidence:
+            if prepared_override is not None:
+                return prepared_override
+            return prepare_evidence(
+                raw_evidence,
+                history,
+                budget=effective_budget,
+                tokenizer=self._tokenizer,
+                tokenizer_id=self._tokenizer.tokenizer_id,
+                counting_mode=self.config.reader.counting_mode,
+            )
+
         prepared, attempt, entry, error = self._record_call(
             stage="prepare",
             method="prepare_evidence",
@@ -1044,15 +1150,10 @@ class OfflineRunner(RunnerBase):
             operation_id=None,
             input_payload={
                 "raw_count": len(raw_evidence),
-                "budget": self.config.evidence_token_budget,
+                "budget": effective_budget,
                 "history_messages": history.message_count(),
             },
-            fn=lambda: prepare_evidence(
-                raw_evidence,
-                history,
-                budget=self.config.evidence_token_budget,
-                tokenizer=tokenizer,
-            ),
+            fn=_run,
             error_transform=_prepare_error_transform,
             attempt_kind=attempt_kind,
         )
@@ -1063,6 +1164,209 @@ class OfflineRunner(RunnerBase):
         assert prepared is not None
         return prepared
 
+    # -- context precheck (M2) ----------------------------------------------
+
+    def _context_profile(self) -> dict[str, Any] | None:
+        """Reader context profile; None when no window is declared (M1)."""
+        window = self.config.reader.context_window_tokens
+        if window is None:
+            return None
+        return {
+            "window": window,
+            "format_overhead": self.config.reader.format_overhead_tokens,
+            "output_reserve": self.config.reader.output_reserve_tokens or 0,
+        }
+
+    def _precheck_stage(
+        self,
+        handle: str,
+        namespace: str,
+        question: Any,
+        sessions: list[Any],
+        attempts: list[StageAttempt],
+        entries: list[AttemptEntry],
+        attempt_kind: str = "logical",
+    ) -> _PrecheckOutcome:
+        """Fixed context precheck BEFORE any model call (M2).
+
+        Budget-bound baselines precheck against the worst case (the full
+        evidence budget); the full-history control renders its complete
+        history under the context-derived allowance — a history that
+        cannot fit ends the sample as context_exceeded (explicit, never
+        silently truncated). Returns the precomputed full-history
+        PreparedEvidence when the control passes (reused verbatim by the
+        prepare stage), else None.
+        """
+        profile = self._context_profile()
+        if profile is None:
+            return _PrecheckOutcome()
+        baseline = self.config.memory.baseline_kind
+        template = get_prompt_template(self.config.reader.prompt_template_id)
+        prompt_question_tokens = public_prompt_tokens(
+            template, question, self._tokenizer
+        )
+
+        def _run() -> dict[str, Any]:
+            if baseline == "full_history":
+                allowance = full_history_allowance(
+                    prompt_question_tokens=prompt_question_tokens,
+                    format_overhead_tokens=profile["format_overhead"],
+                    output_reserve_tokens=profile["output_reserve"],
+                    context_window_tokens=profile["window"],
+                )
+                raw = full_history_evidence(sessions)
+                try:
+                    rendered = prepare_evidence(
+                        raw,
+                        build_history_index(sessions),
+                        budget=max(allowance, 1),
+                        tokenizer=self._tokenizer,
+                        tokenizer_id=self._tokenizer.tokenizer_id,
+                        counting_mode=self.config.reader.counting_mode,
+                    )
+                except PrepareError as exc:
+                    return {"check": {"fits": False, "error": exc.to_dict()}}
+                truncated = any(item.truncated for item in rendered.items)
+                if allowance <= 0 or rendered.dropped_raw_indices or truncated:
+                    # The FULL render needs more than the allowance; prove
+                    # the exceedance without re-rendering unbudgeted.
+                    check = check_context(
+                        prompt_question_tokens=prompt_question_tokens,
+                        evidence_tokens=max(allowance, 0) + 1,
+                        format_overhead_tokens=profile["format_overhead"],
+                        output_reserve_tokens=profile["output_reserve"],
+                        context_window_tokens=profile["window"],
+                    )
+                    return {
+                        "check": check.to_dict(),
+                        "truncated_units": len(rendered.dropped_raw_indices),
+                        "partial_truncation": truncated,
+                    }
+                check = check_context(
+                    prompt_question_tokens=prompt_question_tokens,
+                    evidence_tokens=rendered.token_count,
+                    format_overhead_tokens=profile["format_overhead"],
+                    output_reserve_tokens=profile["output_reserve"],
+                    context_window_tokens=profile["window"],
+                )
+                return {
+                    "check": check.to_dict(),
+                    "prepared_token_count": rendered.token_count,
+                    "units": len(rendered.items),
+                }
+            # Budget-bound baselines: worst case is the full budget.
+            evidence_tokens = 0 if baseline == "none" else self.config.evidence_token_budget
+            check = check_context(
+                prompt_question_tokens=prompt_question_tokens,
+                evidence_tokens=evidence_tokens,
+                format_overhead_tokens=profile["format_overhead"],
+                output_reserve_tokens=profile["output_reserve"],
+                context_window_tokens=profile["window"],
+            )
+            return {"check": check.to_dict(), "evidence_worst_case": evidence_tokens}
+
+        result, attempt, entry, error = self._record_call(
+            stage="precheck",
+            method="context_precheck",
+            namespace=namespace,
+            operation_id=None,
+            input_payload={
+                "context_window_tokens": profile["window"],
+                "format_overhead_tokens": profile["format_overhead"],
+                "output_reserve_tokens": profile["output_reserve"],
+                "baseline_kind": baseline,
+                "counting_mode": self.config.reader.counting_mode,
+                "tokenizer_id": self._tokenizer.tokenizer_id,
+            },
+            fn=_run,
+            attempt_kind=attempt_kind,
+        )
+        attempts.append(attempt)
+        entries.append(entry)
+        if error is not None:
+            raise _StageFailure("precheck", error)
+        assert result is not None
+        check_doc = result["check"]
+        if not check_doc.get("fits", True):
+            detail = check_doc.get("detail", "context window exceeded")
+            error = ErrorInfo(
+                code="context_exceeded",
+                message=(
+                    f"{detail}; the sample never reaches the reader "
+                    "(no silent truncation) and contributes zero to "
+                    "planned-question scores"
+                ),
+                effect="none",
+                transient=False,
+            )
+            # Record the verdict itself as a failed attempt (mirrors the
+            # await_ready-timeout pattern: the failure must be auditable
+            # in the per-sample attempt log, not only in the Result row).
+            attempt_id = self._next_attempt_id("precheck")
+            started_at = self._clock()
+            attempts.append(
+                StageAttempt(
+                    attempt_id=attempt_id,
+                    stage="precheck",
+                    operation_id=None,
+                    outcome="error",
+                    started_at=started_at,
+                    ended_at=self._clock(),
+                    elapsed_ms=0.0,
+                    input_ref=inline_ref(
+                        {
+                            "context_window_tokens": profile["window"],
+                            "baseline_kind": baseline,
+                        }
+                    ),
+                    output_ref=None,
+                    error=error,
+                    usage=None,
+                    attempt_kind=attempt_kind,  # type: ignore[arg-type]
+                )
+            )
+            entries.append(
+                AttemptEntry(
+                    attempt_id=attempt_id,
+                    stage="precheck",
+                    method="context_precheck",
+                    namespace=namespace,
+                    operation_id=None,
+                    started_at=started_at,
+                    ended_at=self._clock(),
+                    elapsed_ms=0.0,
+                    input={
+                        "context_window_tokens": profile["window"],
+                        "baseline_kind": baseline,
+                    },
+                    output=None,
+                    error=error,
+                    usage=None,
+                    attempt_kind=attempt_kind,  # type: ignore[arg-type]
+                )
+            )
+            raise _ContextExceeded("precheck", error)
+        if baseline == "full_history" and "prepared_token_count" in result:
+            # Passed with a fully retained render: rebuild it for the
+            # prepare stage (deterministic, identical to this render).
+            allowance = full_history_allowance(
+                prompt_question_tokens=prompt_question_tokens,
+                format_overhead_tokens=profile["format_overhead"],
+                output_reserve_tokens=profile["output_reserve"],
+                context_window_tokens=profile["window"],
+            )
+            raw = full_history_evidence(sessions)
+            rendered = prepare_evidence(
+                raw,
+                build_history_index(sessions),
+                budget=max(allowance, 1),
+                tokenizer=self._tokenizer,
+                tokenizer_id=self._tokenizer.tokenizer_id,
+                counting_mode=self.config.reader.counting_mode,
+            )
+            return _PrecheckOutcome(prepared=rendered, allowance=allowance)
+        return _PrecheckOutcome()
+
     def _run_sample(
         self,
         handle: str,
@@ -1071,7 +1375,9 @@ class OfflineRunner(RunnerBase):
     ) -> ResultArtifact:
         namespace = self.dataset.namespace_for(handle, self.config.sample_plan_id)
         self._lifecycle_entries = []
+        has_context_profile = self.config.reader.context_window_tokens is not None
         stage_states: dict[str, str] = {
+            **({"precheck": "pending"} if has_context_profile else {}),
             "ingest": "pending",
             "retrieve": "pending",
             "prepare": "pending",
@@ -1089,6 +1395,8 @@ class OfflineRunner(RunnerBase):
         failed_stage: str | None = None
         failure: ErrorInfo | None = None
         invalid_input = False
+        context_exceeded = False
+        precheck: _PrecheckOutcome | None = None
         raw_evidence: list[Evidence] | None = (
             resume.saved_raw if resume is not None else None
         )
@@ -1118,43 +1426,78 @@ class OfflineRunner(RunnerBase):
         )
 
         if memory_phase:
-            self._record_lifecycle(
-                "reset", namespace, lambda: self.adapter.reset(namespace)
-            )
-            try:
-                self._ingest_phase(
-                    handle,
-                    namespace,
-                    sessions,
-                    attempts,
-                    entries,
-                    stage_states,
-                    base_kind=base_kind,
-                )
-
-                # Query phase: reopen the persisted space and retrieve.
+            # Context precheck runs BEFORE any adapter/model work: a
+            # question that cannot fit the reader window never ingests,
+            # never retrieves and never calls the reader (M2).
+            question = self.dataset.get_question(handle)
+            if has_context_profile:
+                try:
+                    precheck = self._precheck_stage(
+                        handle,
+                        namespace,
+                        question,
+                        sessions,
+                        attempts,
+                        entries,
+                        attempt_kind=base_kind,
+                    )
+                    stage_states["precheck"] = "completed"
+                except _ContextExceeded as exc:
+                    failed_stage = exc.stage
+                    failure = exc.error
+                    context_exceeded = True
+                    stage_states["precheck"] = "failed"
+                except _StageFailure as exc:
+                    failed_stage = exc.stage
+                    failure = exc.error
+                    if exc.stage in stage_states:
+                        stage_states[exc.stage] = "failed"
+            if not context_exceeded:
                 self._record_lifecycle(
-                    "open", namespace, lambda: self.adapter.open(namespace)
+                    "reset", namespace, lambda: self.adapter.reset(namespace)
                 )
-                raw = self._retrieve_stage(
-                    handle, namespace, attempts, entries, attempt_kind=base_kind
-                )
-                raw_evidence = list(raw)
-                new_raw = True
-                stage_states["retrieve"] = "completed"
+                try:
+                    self._ingest_phase(
+                        handle,
+                        namespace,
+                        sessions,
+                        attempts,
+                        entries,
+                        stage_states,
+                        base_kind=base_kind,
+                    )
 
-                history = build_history_index(sessions)
-                prepared = self._prepare_stage(
-                    namespace, raw_evidence, history, attempts, entries,
-                    attempt_kind=base_kind,
-                )
-                new_prepared = True
-                stage_states["prepare"] = "completed"
-            except _StageFailure as exc:
-                failed_stage = exc.stage
-                failure = exc.error
-                if exc.stage in stage_states:
-                    stage_states[exc.stage] = "failed"
+                    # Query phase: reopen the persisted space and retrieve.
+                    self._record_lifecycle(
+                        "open", namespace, lambda: self.adapter.open(namespace)
+                    )
+                    raw = self._retrieve_stage(
+                        handle, namespace, attempts, entries, attempt_kind=base_kind
+                    )
+                    raw_evidence = list(raw)
+                    new_raw = True
+                    stage_states["retrieve"] = "completed"
+
+                    history = build_history_index(sessions)
+                    prepared = self._prepare_stage(
+                        namespace,
+                        raw_evidence,
+                        history,
+                        attempts,
+                        entries,
+                        attempt_kind=base_kind,
+                        budget=precheck.allowance if precheck is not None else None,
+                        prepared_override=(
+                            precheck.prepared if precheck is not None else None
+                        ),
+                    )
+                    new_prepared = True
+                    stage_states["prepare"] = "completed"
+                except _StageFailure as exc:
+                    failed_stage = exc.stage
+                    failure = exc.error
+                    if exc.stage in stage_states:
+                        stage_states[exc.stage] = "failed"
         elif resume is not None and resume.saved_prepared is None:
             # Failed at prepare with the raw return already saved: re-run
             # the deterministic preparation only; no adapter calls.
@@ -1307,7 +1650,7 @@ class OfflineRunner(RunnerBase):
                     stage_states["judge"] = "completed"
         finally:
             # Best-effort close; lifecycle failures land in the log only.
-            if memory_phase:
+            if memory_phase and not context_exceeded:
                 self._record_lifecycle(
                     "close", namespace, lambda: self.adapter.close(namespace)
                 )
@@ -1390,7 +1733,11 @@ class OfflineRunner(RunnerBase):
             correct: bool | None = scoring.correct
             attribution = scoring.attribution
         else:
-            qa_status = "invalid_input" if invalid_input else "failed"
+            qa_status = (
+                "invalid_input"
+                if invalid_input
+                else ("context_exceeded" if context_exceeded else "failed")
+            )
             correct = None
             attribution = None
         result = Result(

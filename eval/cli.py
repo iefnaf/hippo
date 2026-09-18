@@ -57,13 +57,32 @@ def _load_config_or_exit(path: str) -> ExperimentConfig:
         raise SystemExit(2) from exc
 
 
+def _build_components(config: ExperimentConfig):
+    """Build the (adapter, reader, judge) components a config declares.
+
+    Baseline kinds (none/bm25/full_history) build their harness
+    baseline adapters; api='openai_chat' plans build the real clients
+    (credentials resolved from the named environment variables at call
+    time); everything else stays on the offline fakes.
+    """
+    from eval.judges import build_judge_for_plan
+    from eval.memories import build_memory_for_plan
+    from eval.readers import build_reader_for_plan
+
+    return (
+        build_memory_for_plan(config.memory),
+        build_reader_for_plan(config.reader),
+        build_judge_for_plan(config.judge),
+    )
+
+
 def _execute_offline_run(config: ExperimentConfig, args: argparse.Namespace) -> int:
     from eval.contracts.common import now_utc
-    from eval.memories.fake import build_fake_adapter
+    from eval.memories import build_memory_for_plan
     from eval.runs import RunStore, new_run_id
 
     try:
-        adapter = build_fake_adapter(config.memory)
+        adapter = build_memory_for_plan(config.memory)
     except ContractError as exc:
         _print_contract_error(exc)
         return 2
@@ -93,8 +112,8 @@ def _execute_offline_run(config: ExperimentConfig, args: argparse.Namespace) -> 
         return 0 if outcome.failed == 0 else 1
 
     from eval.datasets import load_dataset_for_config
-    from eval.judges.fake import build_fake_judge
-    from eval.readers.fake import build_fake_reader
+    from eval.judges import build_judge_for_plan
+    from eval.readers import build_reader_for_plan
     from eval.runner import OfflineRunner
 
     try:
@@ -102,15 +121,19 @@ def _execute_offline_run(config: ExperimentConfig, args: argparse.Namespace) -> 
     except ContractError as exc:
         _print_contract_error(exc)
         return 2
-    runner = OfflineRunner(
-        config=config,
-        dataset=dataset,
-        adapter=adapter,
-        reader=build_fake_reader(config.reader),
-        judge=build_fake_judge(config.judge),
-        store=store,
-        run_id=run_id,
-    )
+    try:
+        runner = OfflineRunner(
+            config=config,
+            dataset=dataset,
+            adapter=adapter,
+            reader=build_reader_for_plan(config.reader),
+            judge=build_judge_for_plan(config.judge),
+            store=store,
+            run_id=run_id,
+        )
+    except ContractError as exc:
+        _print_contract_error(exc)
+        return 2
     try:
         outcome = runner.run()
     except ContractError as exc:
@@ -184,11 +207,11 @@ def _execute_resume(config: ExperimentConfig, args: argparse.Namespace) -> int:
     from pathlib import Path
 
     from eval.contracts.common import now_utc
-    from eval.memories.fake import build_fake_adapter
+    from eval.memories import build_memory_for_plan
     from eval.runs import RunStore
 
     try:
-        adapter = build_fake_adapter(config.memory)
+        adapter = build_memory_for_plan(config.memory)
     except ContractError as exc:
         _print_contract_error(exc)
         return 2
@@ -218,8 +241,8 @@ def _execute_resume(config: ExperimentConfig, args: argparse.Namespace) -> int:
         return 0 if outcome.failed == 0 else 1
 
     from eval.datasets import load_dataset_for_config
-    from eval.judges.fake import build_fake_judge
-    from eval.readers.fake import build_fake_reader
+    from eval.judges import build_judge_for_plan
+    from eval.readers import build_reader_for_plan
     from eval.runner import OfflineRunner
 
     try:
@@ -227,15 +250,19 @@ def _execute_resume(config: ExperimentConfig, args: argparse.Namespace) -> int:
     except ContractError as exc:
         _print_contract_error(exc)
         return 2
-    runner = OfflineRunner(
-        config=config,
-        dataset=dataset,
-        adapter=adapter,
-        reader=build_fake_reader(config.reader),
-        judge=build_fake_judge(config.judge),
-        store=store,
-        run_id=run_dir.name,
-    )
+    try:
+        runner = OfflineRunner(
+            config=config,
+            dataset=dataset,
+            adapter=adapter,
+            reader=build_reader_for_plan(config.reader),
+            judge=build_judge_for_plan(config.judge),
+            store=store,
+            run_id=run_dir.name,
+        )
+    except ContractError as exc:
+        _print_contract_error(exc)
+        return 2
     try:
         outcome = runner.resume()
     except ContractError as exc:
