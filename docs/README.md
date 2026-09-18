@@ -16,6 +16,7 @@
 - [Memory Eval Harness 第一版设计](design/eval-harness.md)
 - [Eval Harness 数据契约草案](design/eval-harness-data-contracts.md)：公共输入输出、证据结构、回执及 harness 内部评分与记录类型。
 - [Eval Harness 单题调用图](design/diagrams/eval-harness-calls.html)：可缩放、点选查看调用与数据说明；[图源](design/diagrams/eval-harness-calls.sequence.json)。
+- [Judge 校准人工标注工作流](design/judge-calibration-workflow.md)：M2 校准的操作文档——抽样清单、盲标表格模板、导入方式与 live 执行步骤。
 
 ## 写作约定
 
