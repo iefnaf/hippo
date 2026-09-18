@@ -184,23 +184,10 @@ class TestSameQuestionSetAcrossBaselines:
     """AC1: the three baselines run the SAME dev-set question set.
 
     The committed dev50 configs pin one identical sample list (checked
-    here); a 12-question slice of that list then runs through all three
-    baselines offline, each producing its own report over the identical
-    planned set.
+    in tests/eval/test_baselines.py so CI always runs it); a 12-question
+    slice of that list then runs through all three baselines offline,
+    each producing its own report over the identical planned set.
     """
-
-    def test_dev50_configs_pin_one_identical_question_set(self):
-        from eval.config import load_config_toml
-
-        plans = {}
-        for baseline in ("none", "bm25", "full_history"):
-            config = load_config_toml(
-                f"eval/configs/examples/real_dev50_{baseline}.toml"
-            )
-            assert config.sample_plan_id == "longmemeval-s-dev-50"
-            assert len(config.sample_ids) == 50
-            plans[baseline] = list(config.sample_ids)
-        assert plans["none"] == plans["bm25"] == plans["full_history"]
 
     def test_three_baselines_report_over_identical_planned_set(self, tmp_path):
         import json as _json

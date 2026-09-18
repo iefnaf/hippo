@@ -243,6 +243,35 @@ class TestBM25Adapter:
 # ---------------------------------------------------------------------------
 
 
+class TestCommittedRealConfigs:
+    """The committed real-run configs (loading them needs no data or
+    credentials): the three dev50 baselines must pin one identical
+    question set — that is what makes them the same-development-set
+    comparison of issue #8 AC1."""
+
+    def test_dev50_configs_pin_one_identical_question_set(self):
+        from eval.config import load_config_toml
+
+        plans = {}
+        for baseline in ("none", "bm25", "full_history"):
+            config = load_config_toml(
+                f"eval/configs/examples/real_dev50_{baseline}.toml"
+            )
+            assert config.sample_plan_id == "longmemeval-s-dev-50"
+            assert len(config.sample_ids) == 50
+            plans[baseline] = list(config.sample_ids)
+        assert plans["none"] == plans["bm25"] == plans["full_history"]
+        # the smoke-live trio pins the same fixed 8-question subset
+        smoke = {}
+        for baseline in ("none", "bm25", "full_history"):
+            config = load_config_toml(
+                f"eval/configs/examples/real_smoke_live_{baseline}.toml"
+            )
+            assert config.smoke_subset_ids == config.sample_ids
+            smoke[baseline] = list(config.sample_ids)
+        assert smoke["none"] == smoke["bm25"] == smoke["full_history"]
+
+
 class TestContextMath:
     def test_components_sum_and_exceedance(self):
         check = check_context(
