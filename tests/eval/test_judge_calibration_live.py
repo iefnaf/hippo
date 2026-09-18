@@ -57,7 +57,10 @@ def _tiny_plan() -> CalibrationPlanArtifact:
         CalibrationCandidate(
             condition=cond,
             run_id=f"live-{cond}",
-            sample_handle=f"live-{cond}-001",
+            # Both conditions answer the SAME planned sample (shared
+            # handle): disjoint handles would leave an empty common
+            # population and the plan build refuses to proceed.
+            sample_handle="live-001",
             question="Which package manager does the project use now?",
             expected_answer="pnpm",
             hypothesis="The project now uses pnpm.",

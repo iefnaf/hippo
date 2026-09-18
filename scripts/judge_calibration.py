@@ -13,7 +13,7 @@ Three steps around the HUMAN blind-annotation phase:
           compute statistics + threshold decision and write the
           calibration record (offline)
 
-Typical session (docs/judge-calibration-annotation.md has the full
+Typical session (docs/design/judge-calibration-workflow.md has the full
 workflow for the annotator):
 
     uv run python scripts/judge_calibration.py plan \
