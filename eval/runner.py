@@ -168,20 +168,6 @@ class _UncertainMutation(Exception):
         self.error = error
 
 
-def _jsonable(value: Any) -> Any:
-    if value is None:
-        return None
-    if hasattr(value, "model_dump"):
-        return value.model_dump(mode="json")
-    if isinstance(value, list):
-        return [_jsonable(v) for v in value]
-    if isinstance(value, tuple):
-        return [_jsonable(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _jsonable(v) for k, v in value.items()}
-    return value
-
-
 @dataclass
 class RunOutcome:
     run_id: str
@@ -915,13 +901,6 @@ class OfflineRunner(RunnerBase):
         async_mutation = "async_mutation" in set(self.adapter.capabilities())
         from eval.runs import verify_resume_compatibility
 
-        prior = verify_resume_compatibility(
-            self.config,
-            self.store,
-            namespace_for_handle=lambda handle: self.dataset.namespace_for(
-                handle, self.config.sample_plan_id
-            ),
-        )
         prior = verify_resume_compatibility(
             self.config,
             self.store,
