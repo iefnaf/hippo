@@ -69,6 +69,8 @@ class RunSide:
     #: handle -> {"qa_status": ..., "correct": bool | None} (last wins)
     samples: dict[str, dict[str, Any]] = field(default_factory=dict)
     operations_summary: dict[str, Any] | None = None
+    #: Archived model version record (model_versions.json), if written.
+    model_versions: dict[str, Any] | None = None
 
     @property
     def run_id(self) -> str:
@@ -145,6 +147,17 @@ def load_run_side(run_dir: str | Path) -> RunSide:
         except (OSError, json.JSONDecodeError) as exc:
             raise CompareError(
                 f"operations_summary.json unreadable: {run_dir}: {exc}"
+            ) from exc
+
+    versions_path = run_dir / "model_versions.json"
+    if versions_path.exists():
+        try:
+            side.model_versions = json.loads(
+                versions_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CompareError(
+                f"model_versions.json unreadable: {run_dir}: {exc}"
             ) from exc
 
     samples_path = run_dir / "samples.jsonl"
@@ -238,6 +251,34 @@ def _key_field_diffs(left: RunSide, right: RunSide) -> list[dict[str, Any]]:
         )
     for section in ("reader", "judge", "run_params"):
         diffs.extend(_leaf_diffs(f"/{section}", lc.get(section), rc.get(section)))
+
+    # Model drift (M2): a rolling alias repointed between the two runs
+    # is a CONFIGURATION CHANGE — differing observed response models (or
+    # probe digests, when both archived probes) refuse the same-condition
+    # label; runs written before model_versions.json existed stay
+    # comparable among themselves (nothing observed to differ).
+    if left.model_versions is not None and right.model_versions is not None:
+        for role in ("reader", "judge"):
+            l_resp = (left.model_versions.get(role) or {}).get("response_model")
+            r_resp = (right.model_versions.get(role) or {}).get("response_model")
+            if l_resp != r_resp and (l_resp is not None or r_resp is not None):
+                diffs.append(
+                    {
+                        "field": f"/model_versions/{role}/response_model",
+                        "left": l_resp,
+                        "right": r_resp,
+                    }
+                )
+        l_probe = (left.model_versions.get("probe") or {}).get("probe_digest")
+        r_probe = (right.model_versions.get("probe") or {}).get("probe_digest")
+        if l_probe is not None and r_probe is not None and l_probe != r_probe:
+            diffs.append(
+                {
+                    "field": "/model_versions/probe/probe_digest",
+                    "left": l_probe,
+                    "right": r_probe,
+                }
+            )
 
     # Metric registry: version mismatch refuses metric auto-alignment
     # and breaks the same-condition label (design: 指标注册表).
@@ -645,6 +686,8 @@ def align_metrics(
 
 
 def _side_header(side: RunSide) -> dict[str, Any]:
+    versions = side.model_versions or {}
+    probe = versions.get("probe") or {}
     return {
         "run_id": side.run_id,
         "run_dir": str(side.run_dir),
@@ -657,6 +700,14 @@ def _side_header(side: RunSide) -> dict[str, Any]:
         ),
         "metrics_registry_version": side.registry_version,
         "metrics_registry_content_version": side.registry_content_version,
+        "code_version": side.manifest.get("code_version", ""),
+        "reader_response_model": (versions.get("reader") or {}).get(
+            "response_model"
+        ),
+        "judge_response_model": (versions.get("judge") or {}).get(
+            "response_model"
+        ),
+        "probe_set_id": probe.get("probe_set_id"),
     }
 
 
@@ -742,6 +793,10 @@ def render_markdown(payload: dict[str, Any]) -> str:
                 ["配置指纹", left["config_fingerprint"][:12] + "…", right["config_fingerprint"][:12] + "…"],
                 ["suite", left["suite"], right["suite"]],
                 ["memory", f"{left['memory_name']}（{left['memory_baseline_kind']}）", f"{right['memory_name']}（{right['memory_baseline_kind']}）"],
+                ["代码版本", (left.get("code_version") or "unknown")[:12] + "…", (right.get("code_version") or "unknown")[:12] + "…"],
+                ["reader 响应 model", str(left.get("reader_response_model") or "未观测"), str(right.get("reader_response_model") or "未观测")],
+                ["judge 响应 model", str(left.get("judge_response_model") or "未观测"), str(right.get("judge_response_model") or "未观测")],
+                ["探测集", str(left.get("probe_set_id") or "无"), str(right.get("probe_set_id") or "无")],
                 ["指标注册表", str(left["metrics_registry_version"]), str(right["metrics_registry_version"])],
             ],
         )

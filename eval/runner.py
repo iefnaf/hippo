@@ -89,6 +89,7 @@ from eval.runs import (
     SamplePlanCounts,
     inline_ref,
 )
+from eval.versioning import code_version
 from eval.prepare.tokens import (
     TokenizerUnavailable,
     build_token_counter,
@@ -794,6 +795,7 @@ class OfflineRunner(RunnerBase):
         )
         self.dataset = dataset
         self.reader = reader
+        self.judge = judge
         # Counting mode is fixed by the config: test (M1 fake), exact
         # (pinned offline tokenizer) or estimated (documented heuristic).
         # A missing pinned tokenizer file is a loud config/runtime error,
@@ -853,6 +855,7 @@ class OfflineRunner(RunnerBase):
         manifest = RunManifest(
             run_id=self.run_id,
             created_at=self._clock(),
+            code_version=code_version(),
             config_name=self.config.name,
             config_fingerprint=self.config.fingerprint(),
             metrics_registry_version=self.config.canonical_payload()[
@@ -874,7 +877,30 @@ class OfflineRunner(RunnerBase):
                 config=self.config, config_fingerprint=self.config.fingerprint()
             ),
         )
-        return self._execute(async_mutation, resume=None)
+        # Drift probes (M2): a formal run with a probe set executes the
+        # fixed prompts through the REAL reader path before any sample,
+        # archiving outputs so a repointed alias is discoverable later.
+        probe = self._run_probes_if_configured()
+        return self._execute(async_mutation, resume=None, probe=probe)
+
+    def _run_probes_if_configured(self):
+        if not self.config.reader.probe_set_id:
+            return None
+        if (self.store.dir / "artifacts" / "model_probes.json").exists():
+            # Resume path: probes are archived once per run.
+            return None
+        from eval.models import run_reader_probes
+
+        probe = run_reader_probes(
+            run_id=self.run_id,
+            probe_set_id=self.config.reader.probe_set_id,
+            reader=self.reader,
+            tokenizer_id=self._tokenizer.tokenizer_id,
+            counting_mode=self.config.reader.counting_mode,
+            clock=self._clock,
+        )
+        self.store.write_model_probe_artifact(probe)
+        return probe
 
     def resume(self) -> RunOutcome:
         """Continue a checkpointed run; only unfinished work executes.
@@ -896,8 +922,16 @@ class OfflineRunner(RunnerBase):
                 handle, self.config.sample_plan_id
             ),
         )
+        prior = verify_resume_compatibility(
+            self.config,
+            self.store,
+            namespace_for_handle=lambda handle: self.dataset.namespace_for(
+                handle, self.config.sample_plan_id
+            ),
+        )
         self.store.open_for_resume()
-        outcome = self._execute(async_mutation, resume=prior["results"])
+        probe = self._run_probes_if_configured()
+        outcome = self._execute(async_mutation, resume=prior["results"], probe=probe)
         self.store.append_resume_marker(
             {
                 "resumed_at": self._clock(),
@@ -975,8 +1009,46 @@ class OfflineRunner(RunnerBase):
         elif status == "scored":
             outcome.scored += 1
 
+    def _write_model_versions(self, probe: Any) -> None:
+        """Write the four-identifier version record once per run."""
+        if (self.store.dir / "model_versions.json").exists():
+            return
+        from eval.models import ModelVersionsArtifact, ModelVersionRecord
+
+        def observed(component: Any) -> str | None:
+            models = getattr(component, "observed_models", None)
+            if not models:
+                return None
+            return "; ".join(sorted(models))
+
+        run_date = self._clock()[:10]
+        self.store.write_model_versions(
+            ModelVersionsArtifact(
+                run_id=self.run_id,
+                created_at=self._clock(),
+                code_version=code_version(),
+                reader=ModelVersionRecord(
+                    role="reader",
+                    alias=self.config.reader.model,
+                    response_model=observed(self.reader),
+                    vendor_documented_version=self.config.reader.vendor_documented_version,
+                    vendor_documented_on=self.config.reader.vendor_documented_on,
+                    run_date=run_date,
+                ),
+                judge=ModelVersionRecord(
+                    role="judge",
+                    alias=self.config.judge.model,
+                    response_model=observed(self.judge),
+                    vendor_documented_version=self.config.judge.vendor_documented_version,
+                    vendor_documented_on=self.config.judge.vendor_documented_on,
+                    run_date=run_date,
+                ),
+                probe=probe,
+            )
+        )
+
     def _execute(
-        self, async_mutation: bool, resume: dict[str, Any] | None
+        self, async_mutation: bool, resume: dict[str, Any] | None, probe: Any = None
     ) -> RunOutcome:
         outcome = RunOutcome(run_id=self.run_id, run_dir=self.store.dir)
         for handle in self.config.sample_ids:
@@ -995,6 +1067,7 @@ class OfflineRunner(RunnerBase):
                 outcome.re_run_handles.append(handle)
         from eval.report import Reporter, render_markdown
 
+        self._write_model_versions(probe)
         reporter = Reporter(self.store.dir)
         report = reporter.build()
         outcome.report_refs = self.store.write_report(

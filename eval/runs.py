@@ -81,6 +81,9 @@ class RunManifest(SchemaVersionedModel):
     command: str = "run"
     suite: Literal["qa", "operations"] = "qa"
     created_at: str
+    #: Harness code version (git HEAD + dirty marker; issue #6 leftover).
+    #: Empty for manifests written before the field existed.
+    code_version: str = ""
     config_name: str
     config_fingerprint: str
     metrics_registry_version: str
@@ -344,6 +347,34 @@ class RunStore:
                 scoring_trace.model_dump_json().encode("utf-8"),
             )
         return refs
+
+    def write_model_probe_artifact(self, artifact: Any) -> str:
+        """Persist the archived drift-probe outputs (write-once).
+
+        Written at run start (probes precede samples); a resumed run
+        finds it present and never re-probes (outputs stay archived as
+        produced by the original run).
+        """
+        rel = "artifacts/model_probes.json"
+        if (self.dir / rel).exists():
+            raise ContractError(
+                code="artifact_exists",
+                message=(
+                    f"{rel} already exists in run {self.run_id}; probe "
+                    "outputs are archived once per run"
+                ),
+                location=f"/{rel}",
+            )
+        return self._write_bytes(rel, artifact.model_dump_json().encode("utf-8"))
+
+    def write_model_versions(self, artifact: Any, overwrite: bool = False) -> str:
+        """Persist the run-header model version record (four identifiers
+        per role plus the probe reference); write-once unless resuming."""
+        return self._write_bytes(
+            "model_versions.json",
+            artifact.model_dump_json().encode("utf-8"),
+            overwrite=overwrite,
+        )
 
     def write_operations_summary(self, summary: Any, overwrite: bool = False) -> str:
         """Persist the run-level operations summary; returns its ref."""

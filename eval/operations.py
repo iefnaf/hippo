@@ -271,6 +271,9 @@ class OperationsOutcome:
         }
 
 
+from eval.versioning import code_version
+
+
 class OperationsRunner(RunnerBase):
     """Runs the deterministic operations suite declared by the config.
 
@@ -288,6 +291,7 @@ class OperationsRunner(RunnerBase):
             run_id=self.run_id,
             suite="operations",
             created_at=self._clock(),
+            code_version=code_version(),
             config_name=self.config.name,
             config_fingerprint=self.config.fingerprint(),
             metrics_registry_version=self.config.canonical_payload()[

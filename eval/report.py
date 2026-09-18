@@ -34,6 +34,7 @@ from typing import Any
 from eval.contracts.internal import (
     PreparedEvidenceArtifact,
     RawEvidenceArtifact,
+    ReaderResultArtifact,
     ResultArtifact,
     ScoringTraceArtifact,
 )
@@ -86,6 +87,48 @@ HIT_CRITERION_NOTES = {
     ),
     "never": "never：无记忆基线恒为未命中",
 }
+
+#: Control-role labels (issue #8 AC5): every run report states whether
+#: the run is an equal-budget comparison member or a control with a
+#: different information condition.
+BASELINE_CONTROL_ROLES = {
+    "none": {
+        "role": "no_memory_control",
+        "equal_budget": False,
+        "note": "无记忆对照：reader 不使用历史证据，不参加等预算检索比较。",
+    },
+    "full_history": {
+        "role": "full_history_control",
+        "equal_budget": False,
+        "note": (
+            "完整历史对照：不受 4K 证据预算约束（按上下文窗口整量提供），"
+            "与 4K 检索基线的回答比较属于信息条件不同的对照，不标为等预算；"
+            "不参加排名检索指标（recall 为 N/A）。"
+        ),
+    },
+    "bm25": {
+        "role": "equal_budget_baseline",
+        "equal_budget": True,
+        "note": "等预算检索基线：与 hippo 等实现受同一 4K 证据预算约束。",
+    },
+    "adapter": {
+        "role": "equal_budget_baseline",
+        "equal_budget": True,
+        "note": "被测实现：受 4K 证据预算约束，可与等预算基线同条件比较。",
+    },
+}
+
+
+def baseline_control_role(baseline_kind: str) -> dict[str, Any]:
+    """The run's comparison role label (equal-budget member vs control)."""
+    role = BASELINE_CONTROL_ROLES.get(baseline_kind)
+    if role is None:
+        return {
+            "role": "unknown",
+            "equal_budget": None,
+            "note": f"未知基线类型 {baseline_kind!r}。",
+        }
+    return dict(role)
 
 
 class ReportError(ValueError):
@@ -319,10 +362,17 @@ class Reporter:
         budget = self._budget_composition(prepared, raws)
         cost_model = self._cost_model(results, logs)
         failures = self._failure_rows(results, logs)
+        reader_results = {
+            result.sample_handle: self._load_ref(
+                result.artifact_refs.get("reader_result"), ReaderResultArtifact
+            )
+            for result in results
+        }
         header = {
             "run_id": self.manifest["run_id"],
             "command": self.manifest.get("command", "run"),
             "created_at": self.manifest["created_at"],
+            "code_version": self.manifest.get("code_version", ""),
             "config_name": self.manifest["config_name"],
             "config_fingerprint": self.manifest["config_fingerprint"],
             "dataset_plan": self.manifest["dataset_plan"],
@@ -331,12 +381,18 @@ class Reporter:
             "evidence_token_budget": self.manifest["evidence_token_budget"],
             "memory_name": config["memory"]["name"],
             "memory_baseline_kind": config["memory"]["baseline_kind"],
+            "baseline_control_role": baseline_control_role(
+                config["memory"]["baseline_kind"]
+            ),
             "reader_model": config["reader"]["model"],
             "reader_model_family": config["reader"]["model_family"],
             "judge_model": config["judge"]["model"],
             "judge_model_family": config["judge"]["model_family"],
             "judge_protocol_id": config["judge"]["protocol_id"],
             "counting_mode": config["reader"]["counting_mode"],
+            "tokenizer_id": config["reader"]["tokenizer_id"],
+            "model_versions": self._model_versions_doc(),
+            "context_precheck": self._context_precheck_doc(),
             "metrics_registry_version": self.manifest["metrics_registry_version"],
             "metrics_registry_content_version": REGISTRY_CONTENT_VERSION,
         }
@@ -351,6 +407,12 @@ class Reporter:
             "正式指标全部来自指标注册表；证据预算构成与成本模型为诊断项。",
             "smoke 子集成绩不进入正式报告。",
         ]
+        if config["reader"]["counting_mode"] == "estimated":
+            limitations.insert(
+                0,
+                "估算计数模式（estimated）：预算与 tokens 数字为估算口径，"
+                "与精确计数（exact）结果分开比较，不并表。",
+            )
         if statuses["invalid_input"]:
             limitations.insert(
                 0,
@@ -371,10 +433,84 @@ class Reporter:
             budget=budget,
             cost_model=cost_model,
             failures=failures,
+            token_calibration=self._calibration_block(reader_results),
             limitations=limitations,
         )
 
     # -- blocks ---------------------------------------------------------------
+
+    def _model_versions_doc(self) -> dict[str, Any] | None:
+        """The archived four-identifier version record, if written."""
+        path = self.run_dir / "model_versions.json"
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _context_precheck_doc(self) -> dict[str, Any]:
+        """The configured context precheck inputs (or the M1 no-limit case)."""
+        reader = self.config_doc["config"]["reader"]
+        if reader.get("context_window_tokens") is None:
+            return {
+                "enabled": False,
+                "note": "未声明上下文窗口（M1 离线配置）：预检未执行，可运行覆盖率恒为 1。",
+            }
+        return {
+            "enabled": True,
+            "context_window_tokens": reader["context_window_tokens"],
+            "format_overhead_tokens": reader.get("format_overhead_tokens"),
+            "output_reserve_tokens": reader.get("output_reserve_tokens"),
+            "components": (
+                "公共 prompt+问题 + 证据（等预算基线取预算上界/完整历史取全量渲染）"
+                "+ 消息格式开销 + 固定输出预留"
+            ),
+        }
+
+    def _calibration_block(
+        self, reader_results: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Token counting calibration diagnostics (explicitly NOT a formal
+        metric: local count vs server usage per reader call).
+
+        Estimated-mode calls never merge into exact-mode comparisons; the
+        counting mode is reported with the block.
+        """
+        rows = [
+            artifact.result.calibration
+            for artifact in reader_results.values()
+            if artifact is not None and artifact.result.calibration is not None
+        ]
+        with_server = [c for c in rows if c.server_prompt_tokens is not None]
+        mismatches = [
+            c for c in with_server if (c.delta_tokens or 0) != 0
+        ]
+        deltas = [abs(c.delta_tokens or 0) for c in with_server]
+        counting_modes = sorted({c.counting_mode for c in rows})
+        return {
+            "kind": "diagnostic",
+            "note": (
+                "计数校准（诊断项，不入正式指标）：预算执行以本地计数为准，"
+                "服务端 usage 仅用于校准；差值不为零即记录。"
+            ),
+            "calls_with_calibration": len(rows),
+            "calls_with_server_usage": len(with_server),
+            "mismatch_calls": len(mismatches),
+            "mean_abs_delta_tokens": (
+                round(sum(deltas) / len(deltas), 3) if deltas else None
+            ),
+            "max_abs_delta_tokens": max(deltas) if deltas else None,
+            "counting_modes": counting_modes,
+            "sample_deltas": [
+                {
+                    "local": c.local_prompt_tokens,
+                    "server": c.server_prompt_tokens,
+                    "delta": c.delta_tokens,
+                }
+                for c in with_server[:10]
+            ],
+        }
 
     def _status_block(self, results: list[Any], traces: dict[str, Any]) -> dict[str, Any]:
         counts = {"scored": 0, "failed": 0, "context_exceeded": 0, "invalid_input": 0, "pending": 0}
@@ -1108,9 +1244,55 @@ def _render_markdown_operations(report: SummaryReport) -> str:
     return "\n".join(lines)
 
 
+def _render_model_versions_lines(header: dict[str, Any]) -> list[str]:
+    """Markdown rows for the four-identifier version record + probes."""
+    lines: list[str] = []
+    versions = header.get("model_versions")
+    if versions is None:
+        lines.append(
+            "- 版本记录缺失（该 run 未写入 model_versions.json；新 run 均会写入）"
+        )
+        return lines
+    for role in ("reader", "judge"):
+        record = versions.get(role, {})
+        lines.append(
+            "- {role}：别名 {alias}；响应 model 字段 {resp}；厂商标注 {vendor}"
+            "（{when}）；运行日期 {date}".format(
+                role=role,
+                alias=record.get("alias"),
+                resp=record.get("response_model") or "未观测",
+                vendor=record.get("vendor_documented_version") or "未记录",
+                when=record.get("vendor_documented_on") or "未记录",
+                date=record.get("run_date"),
+            )
+        )
+    probe = versions.get("probe")
+    if probe is None:
+        lines.append("- 漂移探测：本 run 未配置探测集")
+    else:
+        ok = sum(1 for c in probe.get("calls", []) if not c.get("error"))
+        digest = str(probe.get("probe_digest", ""))[:12]
+        lines.append(
+            "- 漂移探测：{sid}（{ok}/{n} 条成功，digest {digest}…）；"
+            "两次 run 探测输出明显不同即判为模型变更".format(
+                sid=probe.get("probe_set_id"),
+                ok=ok,
+                n=len(probe.get("calls", [])),
+                digest=digest,
+            )
+        )
+    lines.append(
+        "- 代码版本：{code}".format(
+            code=header.get("code_version") or versions.get("code_version") or "unknown"
+        )
+    )
+    return lines
+
+
 def _render_markdown_qa(report: SummaryReport) -> str:
     header = report["header"]
     statuses = report["statuses"]
+    role = header.get("baseline_control_role", {})
     lines: list[str] = []
     lines.append("# Memory Eval 运行汇总报告")
     lines.append("")
@@ -1121,14 +1303,18 @@ def _render_markdown_qa(report: SummaryReport) -> str:
                 ["run ID", header["run_id"]],
                 ["配置", f"{header['config_name']}（指纹 {header['config_fingerprint'][:12]}…）"],
                 ["数据计划", f"{header['dataset_plan']} / {header['sample_plan_id']}"],
-                ["证据预算", f"{header['evidence_token_budget']} tokens（{header['counting_mode']} 计数）"],
+                ["证据预算", f"{header['evidence_token_budget']} tokens（{header['counting_mode']} 计数，tokenizer {header.get('tokenizer_id', '—')}）"],
                 ["memory", f"{header['memory_name']}（{header['memory_baseline_kind']}）"],
+                ["对照类型", f"{role.get('role', '—')}（等预算：{'是' if role.get('equal_budget') else '否'}）——{role.get('note', '')}"],
                 ["reader / judge", f"{header['reader_model']} / {header['judge_model']}（协议 {header['judge_protocol_id']}）"],
                 ["指标注册表", f"v{header['metrics_registry_version']}（{header['metrics_registry_content_version']}）"],
             ],
         )
     )
     lines.append("")
+    lines.append("## 模型版本与漂移探测（四项标识）")
+    lines.append("")
+    lines.extend(_render_model_versions_lines(header))
     lines.append("## 状态计数与分母")
     lines.append("")
     failed_stages = ", ".join(
@@ -1273,6 +1459,38 @@ def _render_markdown_qa(report: SummaryReport) -> str:
     lines.append("")
     lines.append("## 规模与成本模型")
     cost = report["cost_model"]
+    lines.append("")
+    calibration = report.get("token_calibration")
+    if calibration:
+        lines.append(calibration["note"])
+        lines.append("")
+        lines.append(
+            _table(
+                ["口径", "数值"],
+                [
+                    ["带校准的 reader 调用", str(calibration["calls_with_calibration"])],
+                    ["带服务端 usage 的调用", str(calibration["calls_with_server_usage"])],
+                    ["计数不一致（差值≠0）", str(calibration["mismatch_calls"])],
+                    ["平均 |差值| tokens", _fmt(calibration["mean_abs_delta_tokens"])],
+                    ["最大 |差值| tokens", _fmt(calibration["max_abs_delta_tokens"])],
+                    ["计数模式", "、".join(calibration["counting_modes"]) or "—"],
+                ],
+            )
+        )
+        lines.append("")
+    precheck = header.get("context_precheck") or {}
+    if precheck.get("enabled"):
+        lines.append(
+            "上下文预检：窗口 {win} tokens（消息格式开销 {fo}、输出预留 {res}）；"
+            "构成 = {comp}；超限题记 context_exceeded 单列。".format(
+                win=precheck.get("context_window_tokens"),
+                fo=precheck.get("format_overhead_tokens"),
+                res=precheck.get("output_reserve_tokens"),
+                comp=precheck.get("components"),
+            )
+        )
+    else:
+        lines.append("上下文预检：" + precheck.get("note", "未启用"))
     lines.append("")
     lines.append(cost["note"])
     lines.append("")
