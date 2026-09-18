@@ -455,10 +455,15 @@ def build_calibration_plan(
         ),
         key=lambda c: (c.condition, c.sample_handle),
     )
-    if strict and not population:
+    if not population:
+        # Even non-strict mode has nothing to sample: the two conditions
+        # must share at least one planned sample handle.
         raise ContractError(
             code="calibration_infeasible",
-            message="no common (question, condition) pairs to calibrate on",
+            message=(
+                "no common (question, condition) pairs to calibrate on — "
+                "the two conditions must cover the same planned samples"
+            ),
             location="(population)",
         )
 
