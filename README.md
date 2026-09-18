@@ -29,3 +29,16 @@ JSON/Markdown 汇总报告，全程 fake 组件、不调外部模型）。
 - 冒烟：`uv run hippo-eval run --config eval/configs/examples/offline_fake.toml --out runs`
   连跑两次后用 compare 验证指纹与成绩可比较（smoke-offline；8 题固定清单已
   锁定在配置，CI 在 GitHub Actions 常跑，全程不调用外部模型）
+- 真实数据接入（M2）：`uv run python scripts/fetch_longmemeval.py`
+  （下载 HuggingFace `xiaowu0162/longmemeval-cleaned` 固定 revision 的
+  `longmemeval_s_cleaned.json`，校验 sha256/大小/500 题/字段清单/30 道拒答题；
+  幂等可重跑，已校验时跳过下载。数据不入 Git；来源链接、revision、校验值、
+  MIT 许可证与核对日期固定在 `eval/datasets/longmemeval.py`，并随数据落盘
+  `data/longmemeval/provenance.json`。`--validate-only` 只验不下载）
+- 50/450 分层划分：`uv run python scripts/make_split.py`
+  （固定种子、按能力类别 × 拒答标志分层，两集合无重叠、并集覆盖全部 500 题、
+  两侧都含拒答题；数据清单提交在 `eval/datasets/splits/longmemeval_s_cleaned/`，
+  `--check` 从固定数据逐字节复核可复现性；8 题真实冒烟清单从中按
+  “六题型各 1 + 拒答 2”抽取，仅取开发集侧）
+- 真实数据冒烟（离线 fake 组件）：`uv run hippo-eval run --config eval/configs/examples/real_smoke_offline.toml --out runs`
+  （8 题真实题目走完整离线闭环；未下载数据时相关测试自动跳过，CI 不依赖该文件）

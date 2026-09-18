@@ -32,12 +32,14 @@ jobs:
           uv run hippo-eval validate
           --config eval/configs/examples/offline_fake.toml
           --config eval/configs/examples/offline_fake_ops.toml
+          --config eval/configs/examples/real_smoke_offline.toml
           --fixture eval/fixtures/manual/raw_evidence.exemplar.json
           --fixture eval/fixtures/manual/result.exemplar.json
           --fixture eval/fixtures/manual/valid.session.json
 
-      - name: 单元测试（365 存量 + compare + review 矩阵 14 项 + 冒烟确定性）
+      - name: 单元测试（存量 + compare + review 矩阵 + 冒烟确定性 + M2 数据接入/划分）
         run: uv run pytest -q
+        # 真实数据门测试（test_longmemeval_real.py）在未下载数据时自动跳过
 
       - name: smoke-offline：固定 8 题两次确定性运行并比较
         run: |
