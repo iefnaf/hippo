@@ -20,7 +20,7 @@ from typing import Any, Literal, Self
 
 from pydantic import Field, field_validator, model_validator
 
-from eval.contracts.common import ContractError, ContractModel
+from eval.contracts.common import ContractError, ContractModel, parse_dataset_time
 from eval.metrics import (
     REGISTRY_CONTENT_VERSION,
     REGISTRY_VERSION,
@@ -71,7 +71,16 @@ class MemoryPlan(ContractModel):
 
 
 class ReaderPlan(ContractModel):
-    """Reader model identity and generation parameters (fixed)."""
+    """Reader model identity and generation parameters (fixed).
+
+    api selects the offline fake ('offline_fake') or a real
+    OpenAI-compatible client ('openai_chat'). Context-precheck fields
+    (context_window_tokens / format_overhead_tokens /
+    output_reserve_tokens) drive the precheck that marks questions
+    context_exceeded BEFORE any model call; output_reserve_tokens is a
+    FIXED configured reserve, deliberately NOT the model's maximum
+    output limit (docs/design/eval-harness.md, Token 预算与模型配置).
+    """
 
     model: str = Field(min_length=1)
     model_family: str = Field(min_length=1)
@@ -80,11 +89,80 @@ class ReaderPlan(ContractModel):
     max_output_tokens: int = Field(gt=0)
     tokenizer_id: str = Field(min_length=1)
     counting_mode: Literal["exact", "estimated", "test"]
+    #: NEW (M2, issue #8):
+    api: Literal["offline_fake", "openai_chat"] = "offline_fake"
+    #: Environment variable NAME only; the value never enters the config.
+    api_key_env: str = ""
+    #: None => no context limit declared (M1 offline behavior; the
+    #: precheck then trivially passes and runnable_coverage stays 1.0).
+    context_window_tokens: int | None = Field(default=None, gt=0)
+    #: Flat chat-template/message-wrapper overhead estimate (precheck).
+    format_overhead_tokens: int = Field(default=64, ge=0)
+    #: Fixed output reserve for the precheck (NOT max_output_tokens).
+    output_reserve_tokens: int | None = Field(default=None, gt=0)
+    #: Public prompt template id (fixed registry; part of the fingerprint).
+    prompt_template_id: str = "offline-fake@0"
+    #: Drift probe set id ("" = no probes; formal real runs set one).
+    probe_set_id: str = ""
+    #: Vendor-documented version + its documentation date (drift record).
+    vendor_documented_version: str = ""
+    vendor_documented_on: str = ""
+    request_timeout_s: float = Field(default=120.0, gt=0)
     extra: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _api_rules(self) -> Self:
+        from eval.models import get_probe_set
+        from eval.prompts import get_prompt_template
+
+        # Template and probe ids must exist BEFORE a run (a typo must be
+        # a config error, not a runtime surprise).
+        get_prompt_template(self.prompt_template_id)
+        if self.probe_set_id:
+            get_probe_set(self.probe_set_id)
+        if self.api == "openai_chat":
+            missing: list[str] = []
+            if not self.api_key_env:
+                missing.append("api_key_env")
+            if self.context_window_tokens is None:
+                missing.append("context_window_tokens")
+            if self.output_reserve_tokens is None:
+                missing.append("output_reserve_tokens")
+            if self.prompt_template_id == "offline-fake@0":
+                missing.append("prompt_template_id (a real reader needs a real public prompt)")
+            if not self.vendor_documented_version:
+                missing.append("vendor_documented_version")
+            if not self.vendor_documented_on:
+                missing.append("vendor_documented_on")
+            if self.counting_mode == "test":
+                missing.append(
+                    "counting_mode (the test char counter is offline-only; "
+                    "use exact or estimated)"
+                )
+            if missing:
+                raise ValueError(
+                    f"reader api='openai_chat' requires {missing}; real "
+                    "endpoints need credentials, a context window, an "
+                    "output reserve and drift identifiers"
+                )
+            parse_dataset_time(self.vendor_documented_on)
+        elif self.api_key_env:
+            raise ValueError(
+                "the offline fake reader must not declare api_key_env "
+                "(credential names belong to real endpoints only)"
+            )
+        return self
 
 
 class JudgePlan(ContractModel):
-    """Judge model identity and official protocol binding (fixed)."""
+    """Judge model identity and official protocol binding (fixed).
+
+    api selects the offline fake ('offline_fake') or a real
+    OpenAI-compatible client ('openai_chat'). A real judge MUST bind the
+    official LongMemEval anscheck protocol (protocol_id from
+    eval.judges.longmemeval) and must document the vendor version it was
+    configured against (drift-record identifiers).
+    """
 
     model: str = Field(min_length=1)
     model_family: str = Field(min_length=1)
@@ -92,7 +170,46 @@ class JudgePlan(ContractModel):
     temperature: float
     protocol_id: str = Field(min_length=1)
     protocol_source_commit: str = Field(min_length=1)
+    #: NEW (M2, issue #8):
+    api: Literal["offline_fake", "openai_chat"] = "offline_fake"
+    #: Environment variable NAME only; the value never enters the config.
+    api_key_env: str = ""
+    #: Official protocol call shape uses max_tokens=10 (upstream).
+    max_output_tokens: int = Field(default=10, gt=0)
+    request_timeout_s: float = Field(default=120.0, gt=0)
+    vendor_documented_version: str = ""
+    vendor_documented_on: str = ""
     extra: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _api_rules(self) -> Self:
+        from eval.judges.longmemeval import OFFICIAL_PROTOCOL_ID
+
+        if self.api == "openai_chat":
+            missing: list[str] = []
+            if not self.api_key_env:
+                missing.append("api_key_env")
+            if not self.vendor_documented_version:
+                missing.append("vendor_documented_version")
+            if not self.vendor_documented_on:
+                missing.append("vendor_documented_on")
+            if self.protocol_id != OFFICIAL_PROTOCOL_ID:
+                missing.append(
+                    f"protocol_id (a real judge binds {OFFICIAL_PROTOCOL_ID!r})"
+                )
+            if missing:
+                raise ValueError(
+                    f"judge api='openai_chat' requires {missing}; the real "
+                    "judge must bind the official protocol and its drift "
+                    "identifiers"
+                )
+            parse_dataset_time(self.vendor_documented_on)
+        elif self.api_key_env:
+            raise ValueError(
+                "the offline fake judge must not declare api_key_env "
+                "(credential names belong to real endpoints only)"
+            )
+        return self
 
 
 class RunParams(ContractModel):

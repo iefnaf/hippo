@@ -142,6 +142,27 @@ class PreparedEvidence(ContractModel):
         return self
 
 
+class TokenCalibration(ContractModel):
+    """Local vs server prompt-token counts for one model call (M2).
+
+    Budget enforcement always uses the LOCAL count; the server-reported
+    ``usage`` value only calibrates it. A mismatch is recorded (never
+    hidden), and estimated-mode calls are never mixed into exact-mode
+    comparisons (counting mode is a key comparability field).
+    """
+
+    counting_mode: Literal["exact", "estimated", "test"]
+    tokenizer_id: str = Field(min_length=1)
+    local_prompt_tokens: int = Field(ge=0)
+    server_prompt_tokens: int | None = Field(default=None, ge=0)
+    #: server - local; null when the server reported no usage.
+    delta_tokens: int | None = Field(default=None)
+    note: str = (
+        "budget enforced on the local count; the server usage only "
+        "calibrates it"
+    )
+
+
 class ReaderResult(ContractModel):
     """An accepted reader answer. Failures never fabricate this object."""
 
@@ -149,6 +170,9 @@ class ReaderResult(ContractModel):
     raw_output: str
     model: str | None
     usage: ResourceUsage | None
+    #: Exact/estimated counting calibration against the server usage
+    #: (M2); null for offline fake readers.
+    calibration: TokenCalibration | None = None
 
 
 class ScoringData(ContractModel):

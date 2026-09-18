@@ -405,7 +405,11 @@ class QAScorer:
             hypothesis=reader_result.hypothesis,
             question_type=scoring.question_type,
             protocol_id=self._protocol_id,
-            protocol_fields={},
+            # The abstention flag is a private scoring datum the official
+            # protocol needs to select its unanswerable-question template
+            # (M2); fake protocols ignore it. It rides in protocol_fields
+            # (protocol-private data), never in the free-form prompt.
+            protocol_fields={"abstention": scoring.is_abstention},
         )
         started_at = self._clock()
         t0 = self._monotonic()

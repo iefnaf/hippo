@@ -435,7 +435,10 @@ class TestJudgePath:
         request = judge.requests[0]
         assert request.protocol_id == "longmemeval-yes-no@1"
         assert request.expected_answer == "pnpm"  # official protocol needs it
-        assert request.protocol_fields == {}
+        assert request.protocol_fields == {"abstention": False}  # M2: the
+        # official protocol selects its abstention template from this
+        # protocol-private flag; gold ids and ID mappings still never ride
+        # along (asserted below)
         dumped = request.model_dump_json()
         assert "gold_source_ids" not in dumped
         assert "internal_to_official" not in dumped
