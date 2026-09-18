@@ -357,6 +357,79 @@ class TestAnnotationImport:
             )
 
 
+class TestCollectRunOutputs:
+    """The plan command's only uncovered main path: reading a finished
+    run directory (judge_record artifacts exist on the fake path too)."""
+
+    @pytest.fixture()
+    def offline_run(self, tmp_path: Path) -> Path:
+        from eval.cli import main
+
+        out = tmp_path / "runs"
+        code = main(
+            [
+                "run",
+                "--config", "eval/configs/examples/offline_fake.toml",
+                "--out", str(out),
+            ]
+        )
+        assert code == 0
+        run_dirs = sorted(out.glob("run-*"))
+        assert len(run_dirs) == 1
+        return run_dirs[0]
+
+    def test_collects_every_sample_with_judge_records(self, offline_run):
+        from eval.calibration.sampling import collect_run_outputs
+
+        candidates, stats = collect_run_outputs(offline_run, "A")
+        assert stats["planned"] == 8
+        assert stats["without_judge_record"] == []
+        assert len(candidates) == 8
+        first = candidates[0]
+        assert first.condition == "A"
+        assert first.run_id == json.loads(
+            (offline_run / "run.json").read_text(encoding="utf-8")
+        )["run_id"]
+        # fields come from the persisted judge_record artifact
+        assert first.question
+        assert first.hypothesis
+        assert first.question_type in TYPES
+        assert isinstance(first.is_abstention, bool)
+
+    def test_refuses_directories_without_samples(self, tmp_path):
+        from eval.calibration.sampling import collect_run_outputs
+
+        with pytest.raises(ContractError, match="no samples.jsonl"):
+            collect_run_outputs(tmp_path, "A")
+
+
+class TestEmptyPopulationGuard:
+    def test_disjoint_handles_are_refused_even_non_strict(self):
+        # e27661d: a non-strict build with an EMPTY common population
+        # must refuse instead of producing a zero-sample plan.
+        candidates = [
+            CalibrationCandidate(
+                condition=c,
+                run_id=f"r-{c}",
+                sample_handle=f"only-{c}",
+                question="Q?",
+                expected_answer="g",
+                hypothesis="h response",
+                question_type="multi-session",
+                is_abstention=False,
+            )
+            for c in ("A", "B")
+        ]
+        with pytest.raises(ContractError, match="no common"):
+            build_calibration_plan(
+                candidates,
+                created_at="2026-09-18T00:00:00Z",
+                strict=False,
+                random_size=1,
+                boundary_size=0,
+            )
+
+
 class TestJudgeInputDiscipline:
     """AC1: the judge sees ONLY question + gold + response."""
 
@@ -904,6 +977,29 @@ class TestRecord:
         decision2 = decide_calibration(stats2)
         assert verify_decision_stability(
             record, statistics=stats2, decision=decision2
+        )
+
+    def test_changed_criteria_return_false_never_silent_reuse(self, monkeypatch):
+        """A changed criteria digest means the stored decision does not
+        apply: stability check returns False (a NEW record is required)
+        instead of raising or silently accepting."""
+        import eval.calibration.record as record_mod
+
+        record, plan, annotations, calls = self._record()
+        stats2 = CalibrationStatistics.model_validate(
+            record.statistics.model_dump()
+        )
+        decision2 = CalibrationDecision.model_validate(
+            record.decision.model_dump()
+        )
+        monkeypatch.setattr(
+            record_mod, "criteria_digest", lambda: "0" * 64
+        )
+        assert (
+            record_mod.verify_decision_stability(
+                record, statistics=stats2, decision=decision2
+            )
+            is False
         )
 
     def test_changed_inputs_raise_instability(self):
