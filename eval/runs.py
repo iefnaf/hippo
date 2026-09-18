@@ -376,6 +376,18 @@ class RunStore:
             overwrite=overwrite,
         )
 
+    def write_judge_calibration(self, payload: str, overwrite: bool = False) -> str:
+        """Persist the attached judge-calibration record (issue #9).
+
+        A run-header artifact like model_versions.json: written once at
+        run start when --judge-calibration is given; the Reporter reads
+        it to decide whether QA conclusions stay formal or are degraded
+        to diagnostics. Write-once unless resuming (the resume path
+        verifies an identical payload instead of rewriting)."""
+        return self._write_bytes(
+            "judge_calibration.json", payload.encode("utf-8"), overwrite=overwrite
+        )
+
     def write_operations_summary(self, summary: Any, overwrite: bool = False) -> str:
         """Persist the run-level operations summary; returns its ref."""
         return self._write_bytes(

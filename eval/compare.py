@@ -591,7 +591,19 @@ def runnable_intersection(left: RunSide, right: RunSide) -> dict[str, Any]:
 def align_metrics(
     left: RunSide, right: RunSide, comp: dict[str, Any]
 ) -> dict[str, Any]:
-    """Align formal metrics; unregistered ids are diagnostics only."""
+    """Align formal metrics; unregistered ids are diagnostics only.
+
+    Issue #9: when either side's judge calibration did not pass, the
+    JUDGE-DEPENDENT QA metrics are moved from the aligned (formal)
+    table into the diagnostics channel with the GPT-4o deviation note —
+    a downgraded configuration never carries formal QA conclusions
+    into a comparison. Retrieval and coverage metrics stay formal
+    (program-computed, judge-independent)."""
+    from eval.calibration.integration import (
+        QA_CONCLUSION_METRIC_IDS,
+        is_downgraded,
+    )
+
     diagnostics: list[dict[str, Any]] = []
     if not comp["metrics_auto_aligned"]:
         return {
@@ -599,6 +611,13 @@ def align_metrics(
             "diagnostics": diagnostics,
             "refused_reason": comp["metrics_alignment_refused_reason"],
         }
+
+    def side_downgraded(side: RunSide) -> bool:
+        if side.suite != "qa" or side.report is None:
+            return False
+        return is_downgraded(side.report.get("judge_calibration"))
+
+    qa_downgraded = side_downgraded(left) or side_downgraded(right)
 
     def metric_rows(side: RunSide) -> dict[str, dict[str, Any]]:
         if side.suite == "operations":
@@ -641,6 +660,24 @@ def align_metrics(
                     "kind": "one_side_only",
                     "note": f"仅左侧报告该指标（右侧无 {metric_id}）",
                     "left": left_rows[metric_id],
+                }
+            )
+            continue
+        if qa_downgraded and metric_id in QA_CONCLUSION_METRIC_IDS:
+            # Judge calibration did not pass on at least one side: the
+            # judge-dependent QA conclusions stay OUT of the formal
+            # aligned table (issue #9, AC3).
+            diagnostics.append(
+                {
+                    "metric_id": metric_id,
+                    "kind": "judge_calibration_downgraded",
+                    "note": (
+                        "judge 校准未达标（至少一侧）：该问答结论降级为诊断项，"
+                        "不进入正式比较与排名；judge 与官方验证过的 GPT-4o "
+                        "不同家族，不宣称与论文分数可比"
+                    ),
+                    "left": left_rows[metric_id],
+                    "right": right_rows.get(metric_id),
                 }
             )
             continue
@@ -708,6 +745,11 @@ def _side_header(side: RunSide) -> dict[str, Any]:
             "response_model"
         ),
         "probe_set_id": probe.get("probe_set_id"),
+        "judge_calibration_status": (
+            (side.report or {}).get("judge_calibration", {}) or {}
+        ).get("status")
+        if side.suite == "qa"
+        else None,
     }
 
 
@@ -797,6 +839,7 @@ def render_markdown(payload: dict[str, Any]) -> str:
                 ["reader 响应 model", str(left.get("reader_response_model") or "未观测"), str(right.get("reader_response_model") or "未观测")],
                 ["judge 响应 model", str(left.get("judge_response_model") or "未观测"), str(right.get("judge_response_model") or "未观测")],
                 ["探测集", str(left.get("probe_set_id") or "无"), str(right.get("probe_set_id") or "无")],
+                ["judge 校准", str(left.get("judge_calibration_status") or "—"), str(right.get("judge_calibration_status") or "—")],
                 ["指标注册表", str(left["metrics_registry_version"]), str(right["metrics_registry_version"])],
             ],
         )

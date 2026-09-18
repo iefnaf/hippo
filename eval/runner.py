@@ -770,6 +770,7 @@ class OfflineRunner(RunnerBase):
         run_id: str,
         clock: Callable[[], str] = now_utc,
         monotonic: Callable[[], float] = time.perf_counter,
+        judge_calibration: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(
             config=config,
@@ -782,6 +783,11 @@ class OfflineRunner(RunnerBase):
         self.dataset = dataset
         self.reader = reader
         self.judge = judge
+        # Optional judge-calibration record (issue #9): a dict parsed
+        # from a committed calibration.json. Validated against the judge
+        # plan (binding) and attached to the run header so the Reporter
+        # can keep QA conclusions formal or degrade them to diagnostics.
+        self._judge_calibration = judge_calibration
         # Counting mode is fixed by the config: test (M1 fake), exact
         # (pinned offline tokenizer) or estimated (documented heuristic).
         # A missing pinned tokenizer file is a loud config/runtime error,
@@ -863,11 +869,56 @@ class OfflineRunner(RunnerBase):
                 config=self.config, config_fingerprint=self.config.fingerprint()
             ),
         )
+        self._attach_judge_calibration()
         # Drift probes (M2): a formal run with a probe set executes the
         # fixed prompts through the REAL reader path before any sample,
         # archiving outputs so a repointed alias is discoverable later.
         probe = self._run_probes_if_configured()
         return self._execute(async_mutation, resume=None, probe=probe)
+
+    def _attach_judge_calibration(self) -> None:
+        """Attach (or verify) the judge-calibration record (issue #9).
+
+        Binding rules: a record may only attach to a REAL judge plan
+        (api='openai_chat') whose model alias, protocol commit and call
+        shape match the calibrated values — any mismatch requires a NEW
+        calibration instead of a silent reuse. On resume the stored
+        payload must equal the provided one byte for byte."""
+        from eval.calibration.record import (
+            CalibrationRecordArtifact,
+            bind_record_to_judge_plan,
+        )
+
+        path = self.store.dir / "judge_calibration.json"
+        if self._judge_calibration is None:
+            if path.exists():
+                return  # resume: the record attached at run start stays
+            return
+        record = CalibrationRecordArtifact.model_validate(self._judge_calibration)
+        if getattr(self.config.judge, "api", "offline_fake") != "openai_chat":
+            raise ContractError(
+                code="calibration_binding_mismatch",
+                message=(
+                    "a judge-calibration record may only attach to a real "
+                    "judge plan (api='openai_chat'); the offline fake judge "
+                    "is its own protocol and needs no calibration"
+                ),
+                location="/judge/api",
+            )
+        bind_record_to_judge_plan(record, self.config.judge)
+        payload = record.model_dump_json()
+        if path.exists():
+            if path.read_text(encoding="utf-8") != payload:
+                raise ContractError(
+                    code="calibration_binding_mismatch",
+                    message=(
+                        "the run already carries a DIFFERENT judge-calibration "
+                        "record; runs are immutable — start a new run"
+                    ),
+                    location="/judge_calibration.json",
+                )
+            return
+        self.store.write_judge_calibration(payload)
 
     def _run_probes_if_configured(self):
         if not self.config.reader.probe_set_id:
@@ -898,6 +949,7 @@ class OfflineRunner(RunnerBase):
         recovery calls are reported as replay usage.
         """
         self._pre_run_checks()
+        self._attach_judge_calibration()
         async_mutation = "async_mutation" in set(self.adapter.capabilities())
         from eval.runs import verify_resume_compatibility
 

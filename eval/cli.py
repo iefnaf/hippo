@@ -76,6 +76,43 @@ def _build_components(config: ExperimentConfig):
     )
 
 
+def _load_judge_calibration_or_exit(args: argparse.Namespace) -> dict | None:
+    """Load the optional judge-calibration record (issue #9).
+
+    A JSON calibration record produced by scripts/judge_calibration.py
+    (report step); attached to the run header so the Reporter can keep
+    QA conclusions formal or degrade them to diagnostics."""
+    import json as _json
+
+    path = getattr(args, "judge_calibration", None)
+    if not path:
+        return None
+    from pathlib import Path
+
+    record_path = Path(path)
+    try:
+        doc = _json.loads(record_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        _print_contract_error(
+            ContractError(
+                code="calibration_missing",
+                message=f"judge-calibration record not found: {record_path}",
+                location="(path)",
+            )
+        )
+        raise SystemExit(2) from exc
+    except _json.JSONDecodeError as exc:
+        _print_contract_error(
+            ContractError(
+                code="invalid_json",
+                message=f"judge-calibration record is not valid JSON: {exc.msg}",
+                location=f"(line {exc.lineno})",
+            )
+        )
+        raise SystemExit(2) from exc
+    return doc
+
+
 def _execute_offline_run(config: ExperimentConfig, args: argparse.Namespace) -> int:
     from eval.contracts.common import now_utc
     from eval.memories import build_memory_for_plan
@@ -130,6 +167,7 @@ def _execute_offline_run(config: ExperimentConfig, args: argparse.Namespace) -> 
             judge=build_judge_for_plan(config.judge),
             store=store,
             run_id=run_id,
+            judge_calibration=_load_judge_calibration_or_exit(args),
         )
     except ContractError as exc:
         _print_contract_error(exc)
@@ -259,6 +297,7 @@ def _execute_resume(config: ExperimentConfig, args: argparse.Namespace) -> int:
             judge=build_judge_for_plan(config.judge),
             store=store,
             run_id=run_dir.name,
+            judge_calibration=_load_judge_calibration_or_exit(args),
         )
     except ContractError as exc:
         _print_contract_error(exc)
@@ -365,6 +404,14 @@ def build_parser() -> argparse.ArgumentParser:
         "data/longmemeval/longmemeval_s_cleaned.json after "
         "scripts/fetch_longmemeval.py)",
     )
+    p_run.add_argument(
+        "--judge-calibration",
+        default=None,
+        metavar="JSON",
+        help="judge-calibration record (scripts/judge_calibration.py) to "
+        "attach to the run header; real-judge runs without a PASSING "
+        "record have their QA conclusions degraded to diagnostics",
+    )
     p_run.set_defaults(func=cmd_run)
 
     p_report = sub.add_parser(
@@ -390,6 +437,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="JSON",
         help="dataset file override (default: the file the config's "
         "dataset_plan pins)",
+    )
+    p_resume.add_argument(
+        "--judge-calibration",
+        default=None,
+        metavar="JSON",
+        help="judge-calibration record to keep attached (must equal the "
+        "one attached at run start)",
     )
     p_resume.set_defaults(func=cmd_resume)
 

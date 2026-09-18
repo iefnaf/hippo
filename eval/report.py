@@ -358,6 +358,7 @@ class Reporter:
         config = self.config_doc["config"]
         statuses = self._status_block(results, traces)
         metrics = self._formal_metrics(results, traces, prepared, raws, logs, statuses)
+        judge_calibration = self._judge_calibration_block(config, metrics)
         attribution = self._attribution_block(results, traces)
         budget = self._budget_composition(prepared, raws)
         cost_model = self._cost_model(results, logs)
@@ -420,6 +421,20 @@ class Reporter:
                 "版本记录留档）：不宣称与论文分数可比，正式结论前须完成"
                 "“Judge 校准”的 100+20 人工判定。",
             )
+        if judge_calibration["qa_conclusions"] == "downgraded_to_diagnostic":
+            limitations.insert(
+                0,
+                "judge 校准"
+                + (
+                    f"（状态 {judge_calibration['status']}）"
+                    if judge_calibration["status"] != "not_calibrated"
+                    else ""
+                )
+                + "未达标：本 run 依赖 judge 的问答结论（计划题整体得分、"
+                "成功评分题准确率、拒答准确率、联合归因四格）已降级为"
+                "诊断项，不进入正式比较；judge 与官方验证过的 GPT-4o 不同"
+                "家族，偏离已记录，不宣称与论文分数可比。",
+            )
         if statuses["invalid_input"]:
             limitations.insert(
                 0,
@@ -441,6 +456,7 @@ class Reporter:
             cost_model=cost_model,
             failures=failures,
             token_calibration=self._calibration_block(reader_results),
+            judge_calibration=judge_calibration,
             limitations=limitations,
         )
 
@@ -455,6 +471,43 @@ class Reporter:
             return json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
+
+    def _judge_calibration_block(
+        self, config: dict[str, Any], metrics: list[MetricAggregate]
+    ) -> dict[str, Any]:
+        """Judge-calibration status of this run (issue #9, diagnostic).
+
+        Reads the attached judge_calibration.json run-header artifact (a
+        run started with --judge-calibration) and decides whether the
+        judge-dependent QA conclusions stay formal. A REAL judge
+        without a passing calibration record degrades them to explicit
+        diagnostics — the deviation from the official GPT-4o judge is
+        stated and paper comparability is never claimed."""
+        from eval.calibration.integration import (
+            QA_CONCLUSION_METRIC_IDS,
+            is_downgraded,
+            judge_calibration_doc,
+        )
+
+        record_doc: dict[str, Any] | None = None
+        path = self.run_dir / "judge_calibration.json"
+        if path.exists():
+            try:
+                record_doc = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                record_doc = {"decision": {"verdict": "unknown"}}
+        doc = judge_calibration_doc(
+            config.get("judge", {}).get("api", "offline_fake"), record_doc
+        )
+        if is_downgraded(doc):
+            for metric in metrics:
+                if metric["metric_id"] in QA_CONCLUSION_METRIC_IDS:
+                    metric["downgraded_to_diagnostic"] = True
+                    metric["reason"] = (
+                        "judge 校准未达标（与官方 GPT-4o 偏离已标注）：该问答"
+                        "结论降级为诊断项，不参与正式比较"
+                    )
+        return doc
 
     def _context_precheck_doc(self) -> dict[str, Any]:
         """The configured context precheck inputs (or the M1 no-limit case)."""
@@ -1206,7 +1259,11 @@ def _render_markdown_operations(report: SummaryReport) -> str:
             [
                 [
                     m["metric_id"],
-                    "computed" if m["status"] == "computed" else "N/A",
+                    (
+                        "computed（降级诊断）"
+                        if m.get("downgraded_to_diagnostic")
+                        else "computed" if m["status"] == "computed" else "N/A"
+                    ),
                     _fmt(m["value"]) if m["status"] == "computed" else "—",
                     m["reason"] or m["denominator"],
                 ]
@@ -1342,6 +1399,39 @@ def _render_markdown_qa(report: SummaryReport) -> str:
         )
     )
     lines.append("")
+    calibration = report.get("judge_calibration")
+    if calibration is not None:
+        lines.append("## Judge 校准（诊断）")
+        lines.append("")
+        lines.append(
+            _table(
+                ["字段", "值"],
+                [
+                    ["状态", calibration["status"]],
+                    ["问答结论", "正式" if calibration["qa_conclusions"] == "formal" else "**已降级为诊断项**"],
+                    ["judge", str(calibration.get("judge_alias") or "—")],
+                    ["校准运行日期", str(calibration.get("calibration_run_date") or "—")],
+                    ["总体一致率", _fmt(calibration.get("overall_agreement"))],
+                    ["Wilson 95% 下界", _fmt(calibration.get("overall_wilson_low"))],
+                    ["无法判定比例", _fmt(calibration.get("undecided_ratio"))],
+                    ["自身一致率", _fmt(calibration.get("self_consistency"))],
+                    ["跨条件差", _fmt(calibration.get("cross_condition_diff"))],
+                ],
+            )
+        )
+        note = calibration.get("downgrade_note") or calibration.get("note") or ""
+        if note:
+            lines.append("")
+            lines.append(note)
+        if calibration.get("official_model_deviation"):
+            lines.append("")
+            lines.append(
+                "官方模型偏离："
+                + str(calibration["official_model_deviation"].get("note", ""))
+            )
+        for item in calibration.get("notes", []):
+            lines.append(f"- {item}")
+        lines.append("")
     lines.append(f"## 正式指标（指标注册表 v{header['metrics_registry_version']}）")
     lines.append("")
     lines.append(
@@ -1350,7 +1440,11 @@ def _render_markdown_qa(report: SummaryReport) -> str:
             [
                 [
                     m["metric_id"],
-                    "computed" if m["status"] == "computed" else "N/A",
+                    (
+                        "computed（降级诊断）"
+                        if m.get("downgraded_to_diagnostic")
+                        else "computed" if m["status"] == "computed" else "N/A"
+                    ),
                     _fmt(m["value"]) if m["status"] == "computed" else "—",
                     m["reason"] or m["denominator"],
                 ]
