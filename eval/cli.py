@@ -92,13 +92,13 @@ def _execute_offline_run(config: ExperimentConfig, args: argparse.Namespace) -> 
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0 if outcome.failed == 0 else 1
 
-    from eval.datasets.manual import DEFAULT_DATASET_PATH, ManualDataset
+    from eval.datasets import load_dataset_for_config
     from eval.judges.fake import build_fake_judge
     from eval.readers.fake import build_fake_reader
     from eval.runner import OfflineRunner
 
     try:
-        dataset = ManualDataset.from_file(args.dataset or DEFAULT_DATASET_PATH)
+        dataset = load_dataset_for_config(config, path=args.dataset)
     except ContractError as exc:
         _print_contract_error(exc)
         return 2
@@ -217,13 +217,13 @@ def _execute_resume(config: ExperimentConfig, args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0 if outcome.failed == 0 else 1
 
-    from eval.datasets.manual import DEFAULT_DATASET_PATH, ManualDataset
+    from eval.datasets import load_dataset_for_config
     from eval.judges.fake import build_fake_judge
     from eval.readers.fake import build_fake_reader
     from eval.runner import OfflineRunner
 
     try:
-        dataset = ManualDataset.from_file(args.dataset or DEFAULT_DATASET_PATH)
+        dataset = load_dataset_for_config(config, path=args.dataset)
     except ContractError as exc:
         _print_contract_error(exc)
         return 2
@@ -333,7 +333,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--dataset",
         default=None,
         metavar="JSON",
-        help="manual dataset fixture (default: the bundled smoke samples)",
+        help="dataset file override (default: the file the config's "
+        "dataset_plan pins: bundled manual smoke samples, or "
+        "data/longmemeval/longmemeval_s_cleaned.json after "
+        "scripts/fetch_longmemeval.py)",
     )
     p_run.set_defaults(func=cmd_run)
 
@@ -358,7 +361,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--dataset",
         default=None,
         metavar="JSON",
-        help="manual dataset fixture (default: the bundled smoke samples)",
+        help="dataset file override (default: the file the config's "
+        "dataset_plan pins)",
     )
     p_resume.set_defaults(func=cmd_resume)
 
